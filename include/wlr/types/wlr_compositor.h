@@ -479,6 +479,23 @@ void wlr_surface_set_preferred_buffer_scale(struct wlr_surface *surface,
 	int32_t scale);
 
 /**
+ * Override the fractional scale advertised for this surface and its
+ * subsurfaces. A scale of zero clears the override.
+ *
+ * This only stores compositor policy. The caller is responsible for sending
+ * the initial fractional-scale and preferred-buffer-scale events; scene output
+ * updates use the override for all subsequent notifications.
+ */
+void wlr_surface_set_preferred_scale_override(struct wlr_surface *surface,
+	double scale);
+
+/**
+ * Return this surface's preferred-scale override, inherited from its root
+ * surface for subsurfaces. Zero means that output-derived scaling is active.
+ */
+double wlr_surface_get_preferred_scale_override(struct wlr_surface *surface);
+
+/**
  * Set the preferred buffer transform for the surface.
  *
  * This sends an event to the client indicating the preferred transform to use

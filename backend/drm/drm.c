@@ -1,3 +1,12 @@
+#include "backend/drm/drm.h"
+#include "backend/drm/color_pipeline.h"
+#include "backend/drm/fb.h"
+#include "backend/drm/iface.h"
+#include "backend/drm/util.h"
+#include "config.h"
+#include "render/color.h"
+#include "types/wlr_output.h"
+#include "util/env.h"
 #include <assert.h>
 #include <drm_fourcc.h>
 #include <drm_mode.h>
@@ -20,14 +29,6 @@
 #include <wlr/util/transform.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-#include "backend/drm/drm.h"
-#include "backend/drm/fb.h"
-#include "backend/drm/iface.h"
-#include "backend/drm/util.h"
-#include "render/color.h"
-#include "types/wlr_output.h"
-#include "util/env.h"
-#include "config.h"
 
 #if HAVE_LIBLIFTOFF
 #include <libliftoff.h>
@@ -111,7 +112,15 @@ bool check_drm_features(struct wlr_drm_backend *drm) {
 	} else {
 		wlr_log(WLR_DEBUG, "Using atomic DRM interface");
 		drm->iface = &atomic_iface;
+#if HAVE_LIBLIFTOFF
+		if (env_parse_bool("WLR_DRM_PREFER_LIBLIFTOFF")) {
+			wlr_log(WLR_INFO, "Trying optional libliftoff interface");
+			drm->iface = &liftoff_iface;
+			drm->liftoff_fallback_allowed = true;
+		}
+#endif
 	}
+	drm_color_pipeline_init(drm);
 #ifdef DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT
 	if (drm->iface == &atomic_iface && drmSetClientCap(drm->fd, DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, 1) == 0) {
 		wlr_log(WLR_INFO, "DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT supported");
@@ -290,13 +299,19 @@ static bool init_planes(struct wlr_drm_backend *drm) {
 			goto error;
 		}
 
+		bool color_ok = drm_color_pipeline_discover(drm, plane);
 		drmModeFreePlane(drm_plane);
+		if (!color_ok)
+			goto error;
 	}
 
 	drmModeFreePlaneResources(plane_res);
 	return true;
 
 error:
+	for (size_t i = 0; drm->planes && i < drm->num_planes; i++) {
+		drm_color_pipeline_finish(&drm->planes[i]);
+	}
 	free(drm->planes);
 	drmModeFreePlaneResources(plane_res);
 	return false;
@@ -347,7 +362,13 @@ bool init_drm_resources(struct wlr_drm_backend *drm) {
 	}
 
 	if (drm->iface->init != NULL && !drm->iface->init(drm)) {
-		goto error_crtcs;
+		if (!drm->liftoff_fallback_allowed) {
+			goto error_crtcs;
+		}
+		wlr_log(WLR_ERROR, "Optional libliftoff initialization failed, using atomic DRM");
+		drm->iface->finish(drm);
+		drm->iface = &atomic_iface;
+		drm->liftoff_fallback_allowed = false;
 	}
 
 	drmModeFreeResources(res);
@@ -411,6 +432,9 @@ void finish_drm_resources(struct wlr_drm_backend *drm) {
 		free(plane->cursor_sizes);
 	}
 
+	for (size_t i = 0; drm->planes && i < drm->num_planes; i++) {
+		drm_color_pipeline_finish(&drm->planes[i]);
+	}
 	free(drm->planes);
 }
 
@@ -421,6 +445,15 @@ static struct wlr_drm_connector *get_drm_connector_from_output(
 	return conn;
 }
 
+bool wlr_drm_output_supports_color_pipeline(struct wlr_output *output) {
+	if (!wlr_output_is_drm(output)) {
+		return false;
+	}
+	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+	return drm_color_pipeline_supported(conn->backend) && !conn->backend->parent &&
+		   conn->backend->iface != &legacy_iface && !drm_connector_is_cursor_visible(conn);
+}
+
 static void layer_handle_addon_destroy(struct wlr_addon *addon) {
 	struct wlr_drm_layer *layer = wl_container_of(addon, layer, addon);
 	wlr_addon_finish(&layer->addon);
@@ -429,8 +462,21 @@ static void layer_handle_addon_destroy(struct wlr_addon *addon) {
 	liftoff_layer_destroy(layer->liftoff);
 #endif
 	drm_fb_clear(&layer->pending_fb);
+	if (layer->pending_in_fence_fd >= 0) {
+		close(layer->pending_in_fence_fd);
+	}
 	drm_fb_clear(&layer->queued_fb);
+	if (layer->queued_release_timeline != NULL) {
+		wlr_drm_syncobj_timeline_signal(layer->queued_release_timeline,
+			layer->queued_release_point);
+		wlr_drm_syncobj_timeline_unref(layer->queued_release_timeline);
+	}
 	drm_fb_clear(&layer->current_fb);
+	if (layer->current_release_timeline != NULL) {
+		wlr_drm_syncobj_timeline_signal(layer->current_release_timeline,
+			layer->current_release_point);
+		wlr_drm_syncobj_timeline_unref(layer->current_release_timeline);
+	}
 	free(layer->candidate_planes);
 	free(layer);
 }
@@ -465,6 +511,7 @@ static struct wlr_drm_layer *get_or_create_layer(struct wlr_drm_backend *drm,
 	}
 
 	layer->wlr = wlr_layer;
+	layer->pending_in_fence_fd = -1;
 
 #if HAVE_LIBLIFTOFF
 	layer->liftoff = liftoff_layer_create(crtc->liftoff);
@@ -587,6 +634,29 @@ static void drm_connector_apply_commit(const struct wlr_drm_connector_state *sta
 	struct wlr_drm_layer *layer;
 	wl_list_for_each(layer, &crtc->layers, link) {
 		drm_fb_move(&layer->queued_fb, &layer->pending_fb);
+		if (layer->pending_in_fence_fd >= 0) {
+			close(layer->pending_in_fence_fd);
+			layer->pending_in_fence_fd = -1;
+		}
+		if (layer->queued_release_timeline != NULL) {
+			wlr_drm_syncobj_timeline_signal(layer->queued_release_timeline,
+				layer->queued_release_point);
+			wlr_drm_syncobj_timeline_unref(layer->queued_release_timeline);
+			layer->queued_release_timeline = NULL;
+		}
+		for (size_t i = 0; i < state->base->layers_len; i++) {
+			const struct wlr_output_layer_state *layer_state =
+				&state->base->layers[i];
+			if (layer_state->layer != layer->wlr ||
+					layer_state->buffer == NULL ||
+					layer_state->signal_timeline == NULL) {
+				continue;
+			}
+			layer->queued_release_timeline =
+				wlr_drm_syncobj_timeline_ref(layer_state->signal_timeline);
+			layer->queued_release_point = layer_state->signal_point;
+			break;
+		}
 	}
 
 	drm_connector_set_pending_page_flip(conn, page_flip);
@@ -598,6 +668,23 @@ static void drm_connector_apply_commit(const struct wlr_drm_connector_state *sta
 	if (!state->active) {
 		drm_plane_finish_surface(crtc->primary);
 		drm_plane_finish_surface(crtc->cursor);
+		struct wlr_drm_layer *layer;
+		wl_list_for_each(layer, &crtc->layers, link) {
+			drm_fb_clear(&layer->queued_fb);
+			if (layer->queued_release_timeline != NULL) {
+				wlr_drm_syncobj_timeline_signal(layer->queued_release_timeline,
+					layer->queued_release_point);
+				wlr_drm_syncobj_timeline_unref(layer->queued_release_timeline);
+				layer->queued_release_timeline = NULL;
+			}
+			drm_fb_clear(&layer->current_fb);
+			if (layer->current_release_timeline != NULL) {
+				wlr_drm_syncobj_timeline_signal(layer->current_release_timeline,
+					layer->current_release_point);
+				wlr_drm_syncobj_timeline_unref(layer->current_release_timeline);
+				layer->current_release_timeline = NULL;
+			}
+		}
 		drm_fb_clear(&conn->cursor_pending_fb);
 
 		conn->cursor_enabled = false;
@@ -628,7 +715,41 @@ static void drm_connector_rollback_commit(const struct wlr_drm_connector_state *
 	struct wlr_drm_layer *layer;
 	wl_list_for_each(layer, &crtc->layers, link) {
 		drm_fb_clear(&layer->pending_fb);
+		if (layer->pending_in_fence_fd >= 0) {
+			close(layer->pending_in_fence_fd);
+			layer->pending_in_fence_fd = -1;
+		}
 	}
+}
+
+static bool can_fallback_from_liftoff(struct wlr_drm_backend *drm,
+		const struct wlr_drm_device_state *state) {
+	if (!drm->liftoff_fallback_allowed) {
+		return false;
+	}
+	for (size_t i = 0; i < state->connectors_len; i++) {
+		const struct wlr_output_state *base = state->connectors[i].base;
+		for (size_t j = 0; j < base->layers_len; j++) {
+			if (base->layers[j].buffer != NULL || base->layers[j].must_scan_out) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static void fallback_from_liftoff(struct wlr_drm_backend *drm) {
+	// TEST_ONLY may have created backend layer addons. Destroy them before
+	// their libliftoff outputs, keeping the compositor-owned layers alive.
+	for (size_t i = 0; i < drm->num_crtcs; i++) {
+		struct wlr_drm_layer *layer, *tmp;
+		wl_list_for_each_safe(layer, tmp, &drm->crtcs[i].layers, link) {
+			layer_handle_addon_destroy(&layer->addon);
+		}
+	}
+	drm->iface->finish(drm);
+	drm->iface = &atomic_iface;
+	drm->liftoff_fallback_allowed = false;
 }
 
 static bool drm_commit(struct wlr_drm_backend *drm,
@@ -647,7 +768,24 @@ static bool drm_commit(struct wlr_drm_backend *drm,
 	}
 
 	bool ok = drm->iface->commit(drm, state, page_flip, flags, test_only);
+	if (!ok && can_fallback_from_liftoff(drm, state)) {
+		wlr_log(WLR_ERROR, "Optional libliftoff startup commit failed, retrying atomic DRM");
+		fallback_from_liftoff(drm);
+		// The failed attempt rolled back its blobs and closed its fence FDs.
+		// Restore a clean baseline in case the retry also fails to prepare.
+		for (size_t i = 0; i < state->connectors_len; i++) {
+			struct wlr_drm_connector_state *conn_state = &state->connectors[i];
+			struct wlr_drm_connector *conn = conn_state->connector;
+			conn_state->mode_id = conn->crtc->mode_id;
+			conn_state->gamma_lut = conn->crtc->gamma_lut;
+			conn_state->hdr_output_metadata = conn->hdr_output_metadata;
+			conn_state->fb_damage_clips = 0;
+			conn_state->primary_in_fence_fd = -1;
+		}
+		ok = drm->iface->commit(drm, state, page_flip, flags, test_only);
+	}
 	if (ok && !test_only) {
+		drm->liftoff_fallback_allowed = false;
 		for (size_t i = 0; i < state->connectors_len; i++) {
 			drm_connector_apply_commit(&state->connectors[i], page_flip);
 		}
@@ -810,7 +948,13 @@ static bool drm_connector_set_pending_layer_fbs(struct wlr_drm_connector *conn,
 	}
 
 	if (!crtc->liftoff) {
-		return true; // libliftoff is disabled
+		for (size_t i = 0; i < state->layers_len; i++) {
+			state->layers[i].accepted = false;
+			if (state->layers[i].must_scan_out) {
+				return false;
+			}
+		}
+		return true; // libliftoff is disabled; compose every layer
 	}
 
 	assert(state->committed & WLR_OUTPUT_STATE_LAYERS);
@@ -823,8 +967,22 @@ static bool drm_connector_set_pending_layer_fbs(struct wlr_drm_connector *conn,
 			return false;
 		}
 
+		if (layer->pending_in_fence_fd >= 0) {
+			close(layer->pending_in_fence_fd);
+			layer->pending_in_fence_fd = -1;
+		}
+
 		if (layer_state->buffer != NULL) {
 			drm_fb_import(&layer->pending_fb, drm, layer_state->buffer, NULL);
+			if (layer->pending_fb != NULL && layer_state->wait_timeline != NULL) {
+				layer->pending_in_fence_fd =
+					wlr_drm_syncobj_timeline_export_sync_file(
+						layer_state->wait_timeline, layer_state->wait_point);
+				if (layer->pending_in_fence_fd < 0) {
+					drm_fb_clear(&layer->pending_fb);
+					return false;
+				}
+			}
 		} else {
 			drm_fb_clear(&layer->pending_fb);
 		}
@@ -887,8 +1045,8 @@ static bool drm_connector_prepare(struct wlr_drm_connector_state *conn_state, bo
 	}
 
 	if ((state->committed & WLR_OUTPUT_STATE_IMAGE_DESCRIPTION) &&
-			conn->backend->iface != &atomic_iface) {
-		wlr_log(WLR_DEBUG, "Image descriptions are only supported by the atomic interface");
+			conn->backend->iface == &legacy_iface) {
+		wlr_log(WLR_DEBUG, "Image descriptions require an atomic DRM interface");
 		return false;
 	}
 
@@ -1427,10 +1585,18 @@ static void realloc_crtcs(struct wlr_drm_backend *drm,
 
 		// Only request a CRTC if the connected is currently enabled or it's the
 		// connector the user wants to enable
-		bool want_crtc = conn == want_conn || conn->output.enabled;
+		bool want_crtc = conn == want_conn || conn->output.enabled || conn->lease_pending;
 
 		if (conn->status == DRM_MODE_CONNECTED && want_crtc) {
 			connector_constraints[i] = conn->possible_crtcs;
+			for (size_t j = 0; j < drm->num_crtcs; j++) {
+				if (drm->crtcs[j].lease != NULL) {
+					connector_constraints[i] &= ~(1u << j);
+				}
+			}
+			if (conn->lease_pending && conn->crtc != NULL) {
+				connector_constraints[i] &= 1u << (conn->crtc - drm->crtcs);
+			}
 		} else {
 			// Will always fail to match anything
 			connector_constraints[i] = 0;
@@ -1809,6 +1975,16 @@ void scan_drm_connectors(struct wlr_drm_backend *drm,
 		}
 
 		if (wlr_conn && wlr_conn->lease) {
+			// Leasing hides the wlr_output, not the physical connector. Do not
+			// mistake it for a removed connector during an unrelated scan.
+			seen[index] = true;
+			drmModeConnector *leased_conn = drmModeGetConnector(drm->fd, conn_id);
+			if (leased_conn != NULL) {
+				if (leased_conn->connection != DRM_MODE_CONNECTED) {
+					wlr_drm_lease_terminate(wlr_conn->lease);
+				}
+				drmModeFreeConnector(leased_conn);
+			}
 			continue;
 		}
 
@@ -2056,6 +2232,15 @@ static void handle_page_flip(int fd, unsigned seq,
 	struct wlr_drm_layer *layer;
 	wl_list_for_each(layer, &conn->crtc->layers, link) {
 		drm_fb_move(&layer->current_fb, &layer->queued_fb);
+		if (layer->current_release_timeline != NULL) {
+			wlr_drm_syncobj_timeline_signal(layer->current_release_timeline,
+				layer->current_release_point);
+			wlr_drm_syncobj_timeline_unref(layer->current_release_timeline);
+		}
+		layer->current_release_timeline = layer->queued_release_timeline;
+		layer->current_release_point = layer->queued_release_point;
+		layer->queued_release_timeline = NULL;
+		layer->queued_release_point = 0;
 	}
 
 	/* Don't report ZERO_COPY in multi-gpu situations, because we had to copy
@@ -2114,6 +2299,9 @@ static void disconnect_drm_connector(struct wlr_drm_connector *conn) {
 }
 
 void destroy_drm_connector(struct wlr_drm_connector *conn) {
+	if (conn->lease != NULL) {
+		wlr_drm_lease_terminate(conn->lease);
+	}
 	disconnect_drm_connector(conn);
 
 	wl_list_remove(&conn->link);
@@ -2152,6 +2340,26 @@ struct wlr_drm_lease *wlr_drm_create_lease(struct wlr_output **outputs,
 	struct wlr_drm_backend *drm =
 			get_drm_backend_from_backend(outputs[0]->backend);
 
+	// Validate before setting temporary allocation constraints.
+	for (size_t i = 0; i < n_outputs; i++) {
+		struct wlr_drm_connector *conn = get_drm_connector_from_output(outputs[i]);
+		if (conn->backend != drm || conn->lease != NULL) {
+			return NULL;
+		}
+		for (size_t j = 0; j < i; j++) {
+			if (outputs[i] == outputs[j]) {
+				return NULL;
+			}
+		}
+	}
+	for (size_t i = 0; i < n_outputs; i++) {
+		get_drm_connector_from_output(outputs[i])->lease_pending = true;
+	}
+	realloc_crtcs(drm, NULL);
+	for (size_t i = 0; i < n_outputs; i++) {
+		get_drm_connector_from_output(outputs[i])->lease_pending = false;
+	}
+
 	int n_objects = 0;
 	uint32_t objects[4 * n_outputs + 1];
 	for (size_t i = 0; i < n_outputs; ++i) {
@@ -2167,7 +2375,7 @@ struct wlr_drm_lease *wlr_drm_create_lease(struct wlr_output **outputs,
 		objects[n_objects++] = conn->id;
 		wlr_log(WLR_DEBUG, "Connector %d", conn->id);
 
-		if (!drm_connector_alloc_crtc(conn)) {
+		if (conn->crtc == NULL) {
 			wlr_log(WLR_ERROR, "Failed to allocate connector CRTC");
 			return NULL;
 		}
@@ -2220,15 +2428,46 @@ void wlr_drm_lease_terminate(struct wlr_drm_lease *lease) {
 
 	wlr_log(WLR_DEBUG, "Terminating DRM lease %d", lease->lessee_id);
 	int ret = drmModeRevokeLease(drm->fd, lease->lessee_id);
-	if (ret < 0) {
-		wlr_log_errno(WLR_ERROR, "Failed to terminate lease");
+	if (ret < 0 && errno != ENOENT && errno != ENODEV) {
+		// Never report a revoked lease or reuse its objects without kernel
+		// confirmation. Closing the lessor on process exit revokes descendants.
+		wlr_log_errno(WLR_ERROR, "Cannot confirm DRM lease revocation; aborting");
+		abort();
 	}
 
 	drm_lease_destroy(lease);
 }
 
+static void handle_lease_rescan(void *data) {
+	struct wlr_drm_backend *drm = data;
+	drm->lease_rescan = NULL;
+	if (!drm->destroying && drm->session->active) {
+		scan_drm_connectors(drm, NULL);
+	}
+}
+
 void drm_lease_destroy(struct wlr_drm_lease *lease) {
 	struct wlr_drm_backend *drm = lease->backend;
+
+	// A lessee may have left a framebuffer scanning out. Disable its CRTCs
+	// before notifying clients (and before a compositor acknowledges a lock).
+	// These CRTCs are still marked leased and cannot belong to the desktop.
+	for (size_t i = 0; i < drm->num_crtcs; i++) {
+		struct wlr_drm_crtc *crtc = &drm->crtcs[i];
+		if (crtc->lease != lease) {
+			continue;
+		}
+		if (drmModeSetCrtc(drm->fd, crtc->id, 0, 0, 0, NULL, 0, NULL) < 0 &&
+			errno != ENOENT && errno != ENODEV) {
+			if (drm->destroying || (!drm->session->active && !drmIsMaster(drm->fd))) {
+				// The inactive/removed device cannot acknowledge a session lock.
+				wlr_log_errno(WLR_ERROR, "Cannot blank inactive leased CRTC");
+			} else {
+				wlr_log_errno(WLR_ERROR, "Cannot blank leased CRTC; aborting");
+				abort();
+			}
+		}
+	}
 
 	wl_signal_emit_mutable(&lease->events.destroy, NULL);
 
@@ -2248,5 +2487,14 @@ void drm_lease_destroy(struct wlr_drm_lease *lease) {
 	}
 
 	free(lease);
-	scan_drm_connectors(drm, NULL);
+
+	// Defer rediscovery until the caller has finished destroying resources.
+	// This also makes lease scans and backend/connector removal non-reentrant.
+	if (!drm->destroying && drm->session->active && drm->lease_rescan == NULL) {
+		drm->lease_rescan = wl_event_loop_add_idle(drm->session->event_loop,
+			handle_lease_rescan, drm);
+		if (drm->lease_rescan == NULL) {
+			wlr_log(WLR_ERROR, "Failed to schedule DRM lease rediscovery");
+		}
+	}
 }

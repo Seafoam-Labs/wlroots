@@ -68,6 +68,18 @@ static void drm_lease_connector_v1_destroy(
 
 	wlr_log(WLR_DEBUG, "Destroying connector %s", connector->output->name);
 
+	// Requests outlive connector offers. Clear every borrowed pointer before
+	// freeing the connector, including requests invalidated by another output.
+	struct wlr_drm_lease_request_v1 *request;
+	wl_list_for_each(request, &connector->device->requests, link) {
+		for (size_t i = 0; i < request->n_connectors; i++) {
+			if (request->connectors[i] == connector) {
+				request->invalid = true;
+				request->connectors[i] = NULL;
+			}
+		}
+	}
+
 	struct wl_resource *resource, *tmp;
 	wl_resource_for_each_safe(resource, tmp, &connector->resources) {
 		wp_drm_lease_connector_v1_send_withdrawn(resource);
@@ -149,6 +161,7 @@ struct wlr_drm_lease_v1 *wlr_drm_lease_request_v1_grant(
 
 	struct wlr_drm_lease_v1 *lease = calloc(1, sizeof(*lease));
 	if (!lease) {
+		request->invalid = true;
 		wl_resource_post_no_memory(request->resource);
 		return NULL;
 	}
@@ -166,7 +179,7 @@ struct wlr_drm_lease_v1 *wlr_drm_lease_request_v1_grant(
 	lease->drm_lease = wlr_drm_create_lease(outputs, request->n_connectors, &fd);
 	if (!lease->drm_lease) {
 		wlr_log(WLR_ERROR, "wlr_drm_create_lease failed");
-		wp_drm_lease_v1_send_finished(lease->resource);
+		wlr_drm_lease_request_v1_reject(request);
 		free(lease);
 		return NULL;
 	}
@@ -273,6 +286,8 @@ static void drm_lease_request_v1_handle_request_connector(
 			n_connectors * sizeof(struct wlr_drm_lease_connector_v1 *));
 	if (!tmp_connectors) {
 		wlr_log(WLR_ERROR, "Failed to grow connectors request array");
+		request->invalid = true;
+		wl_resource_post_no_memory(request_resource);
 		return;
 	}
 
@@ -289,6 +304,7 @@ static void drm_lease_request_v1_handle_submit(
 	if (!lease_resource) {
 		wlr_log(WLR_ERROR, "Failed to allocate wl_resource");
 		wl_resource_post_no_memory(resource);
+		wl_resource_destroy(resource);
 		return;
 	}
 
@@ -300,6 +316,7 @@ static void drm_lease_request_v1_handle_submit(
 	if (!request) {
 		wlr_log(WLR_DEBUG, "Request has been destroyed");
 		wp_drm_lease_v1_send_finished(lease_resource);
+		wl_resource_destroy(resource);
 		return;
 	}
 
@@ -307,11 +324,13 @@ static void drm_lease_request_v1_handle_submit(
 	if (request->invalid) {
 		wlr_log(WLR_ERROR, "Invalid request");
 		wp_drm_lease_v1_send_finished(lease_resource);
+		wl_resource_destroy(resource);
 		return;
 	} else if (request->n_connectors == 0) {
-		wl_resource_post_error(lease_resource,
+		wl_resource_post_error(resource,
 				WP_DRM_LEASE_REQUEST_V1_ERROR_EMPTY_LEASE,
 				"Lease request has no connectors");
+		wl_resource_destroy(resource);
 		return;
 	}
 
@@ -352,6 +371,7 @@ static void drm_lease_device_v1_handle_create_lease_request(
 		&wp_drm_lease_request_v1_interface, version, id);
 	if (!request_resource) {
 		wlr_log(WLR_ERROR, "Failed to allocate wl_resource");
+		wl_resource_post_no_memory(resource);
 		return;
 	}
 

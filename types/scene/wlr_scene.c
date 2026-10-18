@@ -1,9 +1,21 @@
+#include "types/wlr_scene.h"
+#include "render/color.h"
+#include "render/color_pipeline.h"
+#include "render/drm_format_set.h"
+#include "types/wlr_output.h"
+#include "util/array.h"
+#include "util/env.h"
+#include "util/time.h"
 #include <assert.h>
+#include <wlr/types/wlr_output_presentation.h>
+#include <drm_fourcc.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wlr/backend.h>
-#include <wlr/render/swapchain.h>
+#include <wlr/backend/drm.h>
+#include <wlr/render/allocator.h>
 #include <wlr/render/drm_syncobj.h>
+#include <wlr/render/swapchain.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/types/wlr_compositor.h>
@@ -15,14 +27,12 @@
 #include <wlr/util/log.h>
 #include <wlr/util/region.h>
 #include <wlr/util/transform.h>
-#include "render/color.h"
-#include "types/wlr_output.h"
-#include "types/wlr_scene.h"
-#include "util/array.h"
-#include "util/env.h"
-#include "util/time.h"
 
 #include <wlr/config.h>
+
+#if WLR_HAS_VULKAN_RENDERER
+#include <wlr/render/vulkan.h>
+#endif
 
 #if WLR_HAS_XWAYLAND
 #include <wlr/xwayland/xwayland.h>
@@ -63,6 +73,39 @@ struct wlr_scene *scene_node_get_root(struct wlr_scene_node *node) {
 	}
 	struct wlr_scene *scene = wl_container_of(tree, scene, tree);
 	return scene;
+}
+
+struct scene_node_precise_position {
+	struct wlr_addon addon;
+	double x, y;
+};
+
+static void scene_node_precise_position_destroy(struct wlr_addon *addon) {
+	struct scene_node_precise_position *position =
+		wl_container_of(addon, position, addon);
+	wlr_addon_finish(&position->addon);
+	free(position);
+}
+
+static const struct wlr_addon_interface scene_node_precise_position_impl = {
+	.name = "wlr_scene_node_precise_position",
+	.destroy = scene_node_precise_position_destroy,
+};
+
+static struct scene_node_precise_position *scene_node_get_precise_position(
+		struct wlr_scene_node *node) {
+	struct wlr_addon *addon = wlr_addon_find(&node->addons, NULL,
+		&scene_node_precise_position_impl);
+	return addon == NULL ? NULL : wl_container_of(addon,
+		(struct scene_node_precise_position *)NULL, addon);
+}
+
+static void scene_node_local_position(struct wlr_scene_node *node,
+		double *x, double *y) {
+	struct scene_node_precise_position *position =
+		scene_node_get_precise_position(node);
+	*x = position != NULL ? position->x : node->x;
+	*y = position != NULL ? position->y : node->y;
 }
 
 static void scene_node_init(struct wlr_scene_node *node,
@@ -263,11 +306,14 @@ static void scene_node_opaque_region(struct wlr_scene_node *node, int x, int y,
 
 	if (node->type == WLR_SCENE_NODE_RECT) {
 		struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
-		if (scene_rect->color[3] != 1) {
+		if (scene_rect->force_blend || scene_rect->color[3] != 1) {
 			return;
 		}
 	} else if (node->type == WLR_SCENE_NODE_BUFFER) {
 		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+		if (scene_buffer->force_blend) {
+			return;
+		}
 
 		if (!scene_buffer->buffer) {
 			return;
@@ -332,6 +378,9 @@ struct render_data {
 
 	struct wlr_render_pass *render_pass;
 	pixman_region32_t damage;
+
+	// Aqueous: pending image description of the output being rendered.
+	const struct wlr_output_image_description *output_image_description;
 };
 
 static void logical_to_buffer_coords(pixman_region32_t *region, const struct render_data *data,
@@ -349,25 +398,30 @@ static void output_to_buffer_coords(pixman_region32_t *damage, struct wlr_output
 		wlr_output_transform_invert(output->transform), width, height);
 }
 
-static int scale_length(int length, int offset, float scale) {
-	return round((offset + length) * scale) - round(offset * scale);
+static void scale_fbox_to_box(struct wlr_box *box, double x, double y,
+		int width, int height, float scale) {
+	int left = round(x * scale);
+	int top = round(y * scale);
+	int right = round((x + width) * scale);
+	int bottom = round((y + height) * scale);
+	*box = (struct wlr_box){
+		.x = left,
+		.y = top,
+		.width = right - left,
+		.height = bottom - top,
+	};
 }
 
-static void scale_box(struct wlr_box *box, float scale) {
-	box->width = scale_length(box->width, box->x, scale);
-	box->height = scale_length(box->height, box->y, scale);
-	box->x = round(box->x * scale);
-	box->y = round(box->y * scale);
-}
-
-static void transform_output_box(struct wlr_box *box, const struct render_data *data) {
+static void transform_output_fbox(struct wlr_box *box, double x, double y,
+		int width, int height, const struct render_data *data) {
 	enum wl_output_transform transform = wlr_output_transform_invert(data->transform);
-	scale_box(box, data->scale);
+	scale_fbox_to_box(box, x, y, width, height, data->scale);
 	wlr_box_transform(box, box, transform, data->trans_width, data->trans_height);
 }
 
-static void scene_output_damage(struct wlr_scene_output *scene_output,
-		const pixman_region32_t *damage) {
+static void scene_output_damage_internal(struct wlr_scene_output *scene_output,
+		const pixman_region32_t *damage, bool affects_scene,
+		struct wlr_scene_node *source) {
 	struct wlr_output *output = scene_output->output;
 
 	pixman_region32_t clipped;
@@ -380,9 +434,22 @@ static void scene_output_damage(struct wlr_scene_output *scene_output,
 
 		pixman_region32_union(&scene_output->pending_commit_damage,
 			&scene_output->pending_commit_damage, &clipped);
+		if (affects_scene) {
+			pixman_region32_union(&scene_output->pending_effect_damage,
+				&scene_output->pending_effect_damage, &clipped);
+			if (scene_output->damage_hook != NULL) {
+				scene_output->damage_hook(source, &clipped,
+					scene_output->damage_hook_data);
+			}
+		}
 	}
 
 	pixman_region32_fini(&clipped);
+}
+
+static void scene_output_damage(struct wlr_scene_output *scene_output,
+		const pixman_region32_t *damage) {
+	scene_output_damage_internal(scene_output, damage, true, NULL);
 }
 
 static void scene_output_damage_whole(struct wlr_scene_output *scene_output) {
@@ -394,7 +461,8 @@ static void scene_output_damage_whole(struct wlr_scene_output *scene_output) {
 	pixman_region32_fini(&damage);
 }
 
-static void scene_damage_outputs(struct wlr_scene *scene, const pixman_region32_t *damage) {
+static void scene_damage_outputs(struct wlr_scene *scene,
+		const pixman_region32_t *damage, struct wlr_scene_node *source) {
 	if (pixman_region32_empty(damage)) {
 		return;
 	}
@@ -408,7 +476,7 @@ static void scene_damage_outputs(struct wlr_scene *scene, const pixman_region32_
 			-scene_output->x, -scene_output->y);
 		scale_region(&output_damage, scene_output->output->scale, true);
 		output_to_buffer_coords(&output_damage, scene_output->output);
-		scene_output_damage(scene_output, &output_damage);
+		scene_output_damage_internal(scene_output, &output_damage, true, source);
 		pixman_region32_fini(&output_damage);
 	}
 }
@@ -731,7 +799,7 @@ static void scene_node_update(struct wlr_scene_node *node,
 			scene_node_cleanup_when_disabled(node, scene->restack_xwayland_surfaces, &scene->outputs);
 
 			scene_update_region(scene, damage);
-			scene_damage_outputs(scene, damage);
+			scene_damage_outputs(scene, damage, node);
 			pixman_region32_fini(damage);
 		}
 
@@ -754,7 +822,7 @@ static void scene_node_update(struct wlr_scene_node *node,
 	pixman_region32_fini(&update_region);
 
 	scene_node_visibility(node, damage);
-	scene_damage_outputs(scene, damage);
+	scene_damage_outputs(scene, damage, node);
 	pixman_region32_fini(damage);
 }
 
@@ -772,6 +840,7 @@ struct wlr_scene_rect *wlr_scene_rect_create(struct wlr_scene_tree *parent,
 	scene_rect->width = width;
 	scene_rect->height = height;
 	memcpy(scene_rect->color, color, sizeof(scene_rect->color));
+	scene_rect->input_enabled = true;
 
 	scene_node_update(&scene_rect->node, NULL);
 
@@ -797,6 +866,21 @@ void wlr_scene_rect_set_color(struct wlr_scene_rect *rect, const float color[sta
 
 	memcpy(rect->color, color, sizeof(rect->color));
 	scene_node_update(&rect->node, NULL);
+}
+
+void wlr_scene_rect_set_force_blend(struct wlr_scene_rect *rect,
+		int force_blend) {
+	if (rect->force_blend == (force_blend != 0)) {
+		return;
+	}
+
+	rect->force_blend = force_blend != 0;
+	scene_node_update(&rect->node, NULL);
+}
+
+void wlr_scene_rect_set_input_enabled(struct wlr_scene_rect *rect,
+		int enabled) {
+	rect->input_enabled = enabled != 0;
 }
 
 static void scene_buffer_handle_buffer_release(struct wl_listener *listener,
@@ -956,6 +1040,13 @@ void wlr_scene_buffer_set_buffer_with_options(struct wlr_scene_buffer *scene_buf
 		return;
 	}
 
+	// Buffer ownership, texture invalidation, synchronization and geometry
+	// updates above still apply even when the client supplied no damage.
+	// Transforming an empty region cannot damage any output.
+	if (options->damage != NULL && pixman_region32_empty(options->damage)) {
+		return;
+	}
+
 	int lx, ly;
 	if (!wlr_scene_node_coords(&scene_buffer->node, &lx, &ly)) {
 		return;
@@ -1038,7 +1129,8 @@ void wlr_scene_buffer_set_buffer_with_options(struct wlr_scene_buffer *scene_buf
 			(int)round((lx - scene_output->x) * output_scale),
 			(int)round((ly - scene_output->y) * output_scale));
 		output_to_buffer_coords(&output_damage, scene_output->output);
-		scene_output_damage(scene_output, &output_damage);
+		scene_output_damage_internal(scene_output, &output_damage, true,
+			&scene_buffer->node);
 		pixman_region32_fini(&output_damage);
 	}
 
@@ -1077,6 +1169,16 @@ void wlr_scene_buffer_set_opaque_region(struct wlr_scene_buffer *scene_buffer,
 	scene_node_bounds(&scene_buffer->node, x, y, &update_region);
 	scene_update_region(scene_node_get_root(&scene_buffer->node), &update_region);
 	pixman_region32_fini(&update_region);
+}
+
+void wlr_scene_buffer_set_force_blend(struct wlr_scene_buffer *scene_buffer,
+		int force_blend) {
+	if (scene_buffer->force_blend == (force_blend != 0)) {
+		return;
+	}
+
+	scene_buffer->force_blend = force_blend != 0;
+	scene_node_update(&scene_buffer->node, NULL);
 }
 
 void wlr_scene_buffer_set_source_box(struct wlr_scene_buffer *scene_buffer,
@@ -1251,12 +1353,48 @@ void wlr_scene_node_set_enabled(struct wlr_scene_node *node, bool enabled) {
 }
 
 void wlr_scene_node_set_position(struct wlr_scene_node *node, int x, int y) {
-	if (node->x == x && node->y == y) {
+	struct scene_node_precise_position *position =
+		scene_node_get_precise_position(node);
+	if (position == NULL && node->x == x && node->y == y) {
+		return;
+	}
+	if (position != NULL) {
+		scene_node_precise_position_destroy(&position->addon);
+	}
+	node->x = x;
+	node->y = y;
+	scene_node_update(node, NULL);
+}
+
+void wlr_scene_node_set_position_f64(struct wlr_scene_node *node,
+		double x, double y) {
+	assert(isfinite(x) && isfinite(y));
+	struct scene_node_precise_position *position =
+		scene_node_get_precise_position(node);
+	double old_x = position != NULL ? position->x : node->x;
+	double old_y = position != NULL ? position->y : node->y;
+	if (old_x == x && old_y == y) {
 		return;
 	}
 
-	node->x = x;
-	node->y = y;
+	if (position == NULL) {
+		position = calloc(1, sizeof(*position));
+		if (position == NULL) {
+			// Preserve the existing infallible API contract under memory pressure.
+			node->x = round(x);
+			node->y = round(y);
+			scene_node_update(node, NULL);
+			return;
+		}
+		wlr_addon_init(&position->addon, &node->addons, NULL,
+			&scene_node_precise_position_impl);
+	}
+	position->x = x;
+	position->y = y;
+	// Integer APIs, hit-testing and conservative visibility retain their
+	// historical coordinate space. Rendering uses the precise values below.
+	node->x = round(x);
+	node->y = round(y);
 	scene_node_update(node, NULL);
 }
 
@@ -1355,6 +1493,29 @@ bool wlr_scene_node_coords(struct wlr_scene_node *node,
 	return enabled;
 }
 
+bool wlr_scene_node_coords_f64(struct wlr_scene_node *node,
+		double *lx_ptr, double *ly_ptr) {
+	assert(node);
+
+	double lx = 0, ly = 0;
+	bool enabled = true;
+	while (true) {
+		double x, y;
+		scene_node_local_position(node, &x, &y);
+		lx += x;
+		ly += y;
+		enabled = enabled && node->enabled;
+		if (node->parent == NULL) {
+			break;
+		}
+		node = &node->parent->node;
+	}
+
+	*lx_ptr = lx;
+	*ly_ptr = ly;
+	return enabled;
+}
+
 static void scene_node_for_each_scene_buffer(struct wlr_scene_node *node,
 		int lx, int ly, wlr_scene_buffer_iterator_func_t user_iterator,
 		void *user_data) {
@@ -1404,6 +1565,13 @@ static bool scene_node_at_iterator(struct wlr_scene_node *node,
 		}
 	}
 
+
+	if (node->type == WLR_SCENE_NODE_RECT) {
+		struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
+		if (!scene_rect->input_enabled) {
+			return false;
+		}
+	}
 	at_data->rx = rx;
 	at_data->ry = ry;
 	at_data->node = node;
@@ -1440,12 +1608,60 @@ struct wlr_scene_node *wlr_scene_node_at(struct wlr_scene_node *node,
 struct render_list_entry {
 	struct wlr_scene_node *node;
 	bool highlight_transparent_region;
-	int x, y;
+	double x, y;
 };
+
+#if WLR_HAS_VULKAN_RENDERER
+struct scene_buffer_render_hook_call {
+	struct wlr_scene_output *output;
+	struct wlr_scene_buffer *scene_buffer;
+	const struct wlr_render_texture_options *options;
+};
+
+static bool scene_buffer_render_hook_bridge(
+		const struct wlr_vk_render_texture_attribs *attribs, void *data) {
+	struct scene_buffer_render_hook_call *call = data;
+	return call->output->buffer_render_hook(call->scene_buffer, call->options,
+		attribs, call->output->render_hook_data);
+}
+#endif
 
 static float get_luminance_multiplier(const struct wlr_color_luminances *src_lum,
 		const struct wlr_color_luminances *dst_lum) {
 	return (dst_lum->reference / src_lum->reference) * (src_lum->max / dst_lum->max);
+}
+
+static float scene_buffer_luminance(struct wlr_scene_buffer *scene_buffer,
+	const struct wlr_output_image_description *out_description) {
+	struct wlr_color_luminances src_lum, srgb_lum;
+	wlr_color_transfer_function_get_default_luminance(scene_buffer->transfer_function, &src_lum);
+	wlr_color_transfer_function_get_default_luminance(WLR_COLOR_TRANSFER_FUNCTION_SRGB, &srgb_lum);
+	float luminance_multiplier = get_luminance_multiplier(&src_lum, &srgb_lum);
+
+	// Aqueous: on an HDR (PQ) output, scale relative-luminance (SDR)
+	// content so diffuse white lands on the configured SDR white level.
+	// Predefined Windows-scRGB is client-managed HDR: its fixed stimulus
+	// scale maps 1.0 to 80 cd/m² and must not inherit the SDR-white slider.
+	// Absolute-luminance PQ buffers are left untouched.
+	const struct wlr_output_image_description *out_img_desc = out_description;
+	if (out_img_desc != NULL &&
+		out_img_desc->transfer_function == WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ &&
+		scene_buffer->transfer_function != WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ) {
+		struct wlr_color_luminances pq_lum;
+		wlr_color_transfer_function_get_default_luminance(
+			WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ, &pq_lum);
+		struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
+		bool windows_scrgb =
+			scene_surface != NULL &&
+			wlr_surface_has_windows_scrgb_image_description(scene_surface->surface);
+		if (windows_scrgb) {
+			luminance_multiplier *= 80.0f / pq_lum.reference;
+		} else if (out_img_desc->sdr_white_level > 0) {
+			luminance_multiplier *= (float)(out_img_desc->sdr_white_level / pq_lum.reference);
+		}
+	}
+
+	return luminance_multiplier;
 }
 
 static void scene_entry_render(struct render_list_entry *entry, const struct render_data *data) {
@@ -1462,19 +1678,22 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 		return;
 	}
 
-	int x = entry->x - data->logical.x;
-	int y = entry->y - data->logical.y;
+	if (data->output->node_render_hook != NULL) {
+		data->output->node_render_hook(data->render_pass, node,
+			&render_region, data->output->render_hook_data);
+	}
 
-	struct wlr_box dst_box = {
-		.x = x,
-		.y = y,
-	};
-	scene_node_get_size(node, &dst_box.width, &dst_box.height);
-	transform_output_box(&dst_box, data);
+	double x = entry->x - data->logical.x;
+	double y = entry->y - data->logical.y;
+
+	int width, height;
+	scene_node_get_size(node, &width, &height);
+	struct wlr_box dst_box;
+	transform_output_fbox(&dst_box, x, y, width, height, data);
 
 	pixman_region32_t opaque;
 	pixman_region32_init(&opaque);
-	scene_node_opaque_region(node, x, y, &opaque);
+	scene_node_opaque_region(node, round(x), round(y), &opaque);
 	logical_to_buffer_coords(&opaque, data, false);
 	pixman_region32_subtract(&opaque, &render_region, &opaque);
 
@@ -1485,7 +1704,7 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 	case WLR_SCENE_NODE_RECT:;
 		struct wlr_scene_rect *scene_rect = wlr_scene_rect_from_node(node);
 
-		wlr_render_pass_add_rect(data->render_pass, &(struct wlr_render_rect_options){
+		struct wlr_render_rect_options rect_options = {
 			.box = dst_box,
 			.color = {
 				.r = scene_rect->color[0],
@@ -1494,7 +1713,12 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 				.a = scene_rect->color[3],
 			},
 			.clip = &render_region,
-		});
+		};
+		if (data->output->rect_render_hook == NULL ||
+				!data->output->rect_render_hook(data->render_pass, scene_rect,
+					&rect_options, data->output->render_hook_data)) {
+			wlr_render_pass_add_rect(data->render_pass, &rect_options);
+		}
 		break;
 	case WLR_SCENE_NODE_BUFFER:;
 		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
@@ -1518,7 +1742,8 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 		struct wlr_texture *texture = scene_buffer_get_texture(scene_buffer,
 			data->output->output->renderer);
 		if (texture == NULL) {
-			scene_output_damage(data->output, &render_region);
+			scene_output_damage_internal(data->output, &render_region, true,
+				&scene_buffer->node);
 			break;
 		}
 
@@ -1531,14 +1756,10 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 			wlr_color_primaries_from_named(&primaries, scene_buffer->primaries);
 		}
 
-		struct wlr_color_luminances src_lum, srgb_lum;
-		wlr_color_transfer_function_get_default_luminance(
-			scene_buffer->transfer_function, &src_lum);
-		wlr_color_transfer_function_get_default_luminance(
-			WLR_COLOR_TRANSFER_FUNCTION_SRGB, &srgb_lum);
-		float luminance_multiplier = get_luminance_multiplier(&src_lum, &srgb_lum);
+		float luminance_multiplier =
+			scene_buffer_luminance(scene_buffer, data->output_image_description);
 
-		wlr_render_pass_add_texture(data->render_pass, &(struct wlr_render_texture_options) {
+		struct wlr_render_texture_options texture_options = {
 			.texture = texture,
 			.src_box = scene_buffer->src_box,
 			.dst_box = dst_box,
@@ -1556,7 +1777,26 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 			.luminance_multiplier = &luminance_multiplier,
 			.wait_timeline = scene_buffer->wait_timeline,
 			.wait_point = scene_buffer->wait_point,
-		});
+		};
+
+#if WLR_HAS_VULKAN_RENDERER
+		bool texture_hook_installed = false;
+		struct scene_buffer_render_hook_call hook_call = {
+			.output = data->output,
+			.scene_buffer = scene_buffer,
+			.options = &texture_options,
+		};
+		if (data->output->buffer_render_hook != NULL) {
+			texture_hook_installed = wlr_vk_render_pass_set_texture_hook(
+				data->render_pass, scene_buffer_render_hook_bridge, &hook_call);
+		}
+#endif
+		wlr_render_pass_add_texture(data->render_pass, &texture_options);
+#if WLR_HAS_VULKAN_RENDERER
+		if (texture_hook_installed) {
+			wlr_vk_render_pass_set_texture_hook(data->render_pass, NULL, NULL);
+		}
+#endif
 
 		struct wlr_scene_output_sample_event sample_event = {
 			.output = data->output,
@@ -1702,6 +1942,13 @@ static void scene_output_handle_commit(struct wl_listener *listener, void *data)
 		scene_output, output_commit);
 	struct wlr_output_event_commit *event = data;
 	const struct wlr_output_state *state = event->state;
+	if ((state->committed & WLR_OUTPUT_STATE_ENABLED) && !state->enabled) {
+		wlr_swapchain_destroy(scene_output->color_pipeline_swapchain);
+		scene_output->color_pipeline_swapchain = NULL;
+		scene_output->color_pipeline_composed = false;
+		scene_output->color_pipeline_retry_frames = 0;
+		scene_output->color_pipeline_scanout_retry_frames = 0;
+	}
 
 	// if the output has been committed with a certain damage, we know that region
 	// will be acknowledged by the backend so we don't need to keep track of it
@@ -1710,9 +1957,13 @@ static void scene_output_handle_commit(struct wl_listener *listener, void *data)
 		if (state->committed & WLR_OUTPUT_STATE_DAMAGE) {
 			pixman_region32_subtract(&scene_output->pending_commit_damage,
 				&scene_output->pending_commit_damage, &state->damage);
+			pixman_region32_subtract(&scene_output->pending_effect_damage,
+				&scene_output->pending_effect_damage, &state->damage);
 		} else {
 			pixman_region32_fini(&scene_output->pending_commit_damage);
 			pixman_region32_init(&scene_output->pending_commit_damage);
+			pixman_region32_fini(&scene_output->pending_effect_damage);
+			pixman_region32_init(&scene_output->pending_effect_damage);
 		}
 	}
 
@@ -1753,7 +2004,9 @@ static void scene_output_handle_damage(struct wl_listener *listener, void *data)
 	pixman_region32_copy(&damage, event->damage);
 	wlr_region_transform(&damage, &damage,
 		wlr_output_transform_invert(output->transform), width, height);
-	scene_output_damage(scene_output, &damage);
+	// Output-local presentation changes such as software cursor motion need
+	// repainting, but don't invalidate scene-derived effect caches.
+	scene_output_damage_internal(scene_output, &damage, false, NULL);
 	pixman_region32_fini(&damage);
 }
 
@@ -1776,6 +2029,7 @@ struct wlr_scene_output *wlr_scene_output_create(struct wlr_scene *scene,
 
 	wlr_damage_ring_init(&scene_output->damage_ring);
 	pixman_region32_init(&scene_output->pending_commit_damage);
+	pixman_region32_init(&scene_output->pending_effect_damage);
 	wl_list_init(&scene_output->damage_highlight_regions);
 
 	int prev_output_index = -1;
@@ -1849,6 +2103,7 @@ void wlr_scene_output_destroy(struct wlr_scene_output *scene_output) {
 	wlr_addon_finish(&scene_output->addon);
 	wlr_damage_ring_finish(&scene_output->damage_ring);
 	pixman_region32_fini(&scene_output->pending_commit_damage);
+	pixman_region32_fini(&scene_output->pending_effect_damage);
 	wl_list_remove(&scene_output->link);
 	wl_list_remove(&scene_output->output_commit.link);
 	wl_list_remove(&scene_output->output_damage.link);
@@ -1866,6 +2121,8 @@ void wlr_scene_output_destroy(struct wlr_scene_output *scene_output) {
 	wlr_color_transform_unref(scene_output->prev_supplied_color_transform);
 	wlr_color_transform_unref(scene_output->combined_color_transform);
 	wl_array_release(&scene_output->render_list);
+	wlr_color_transform_unref(scene_output->color_pipeline_identity);
+	wlr_swapchain_destroy(scene_output->color_pipeline_swapchain);
 	free(scene_output);
 }
 
@@ -1891,6 +2148,118 @@ void wlr_scene_output_set_position(struct wlr_scene_output *scene_output,
 	scene_output->y = ly;
 
 	scene_output_update_geometry(scene_output, false);
+}
+
+void wlr_scene_output_set_buffer_render_hook(
+		struct wlr_scene_output *scene_output,
+		wlr_scene_buffer_render_hook_func_t hook, void *data) {
+	if (scene_output->buffer_render_hook == hook &&
+			scene_output->render_hook_data == data) {
+		return;
+	}
+
+	scene_output->buffer_render_hook = hook;
+	scene_output->render_hook_data = data;
+	wlr_damage_ring_add_whole(&scene_output->damage_ring);
+	wlr_output_schedule_frame(scene_output->output);
+}
+
+void wlr_scene_output_set_buffer_needs_composition(
+		struct wlr_scene_output *scene_output,
+		wlr_scene_buffer_needs_composition_func_t predicate) {
+	if (scene_output->buffer_needs_composition == predicate) {
+		return;
+	}
+
+	scene_output->buffer_needs_composition = predicate;
+	wlr_damage_ring_add_whole(&scene_output->damage_ring);
+	wlr_output_schedule_frame(scene_output->output);
+}
+
+void wlr_scene_output_set_rect_render_hook(
+		struct wlr_scene_output *scene_output,
+		wlr_scene_rect_render_hook_func_t hook) {
+	if (scene_output->rect_render_hook == hook) {
+		return;
+	}
+
+	scene_output->rect_render_hook = hook;
+	wlr_damage_ring_add_whole(&scene_output->damage_ring);
+	wlr_output_schedule_frame(scene_output->output);
+}
+
+void wlr_scene_output_set_render_hooks(
+		struct wlr_scene_output *scene_output,
+		wlr_scene_render_begin_hook_func_t begin_hook,
+		wlr_scene_node_render_hook_func_t node_hook) {
+	if (scene_output->render_begin_hook == begin_hook &&
+			scene_output->node_render_hook == node_hook) {
+		return;
+	}
+
+	scene_output->render_begin_hook = begin_hook;
+	scene_output->node_render_hook = node_hook;
+	wlr_damage_ring_add_whole(&scene_output->damage_ring);
+	wlr_output_schedule_frame(scene_output->output);
+}
+
+void wlr_scene_output_set_damage_hook(
+		struct wlr_scene_output *scene_output,
+		wlr_scene_damage_hook_func_t hook, void *data) {
+	scene_output->damage_hook = hook;
+	scene_output->damage_hook_data = data;
+}
+
+int wlr_scene_node_render_order(
+		struct wlr_scene_node *first, struct wlr_scene_node *second) {
+	if (first == second) {
+		return 0;
+	}
+
+	size_t first_depth = 0, second_depth = 0;
+	for (struct wlr_scene_node *node = first; node->parent != NULL;
+			node = &node->parent->node) {
+		first_depth++;
+	}
+	for (struct wlr_scene_node *node = second; node->parent != NULL;
+			node = &node->parent->node) {
+		second_depth++;
+	}
+
+	struct wlr_scene_node *first_branch = first;
+	struct wlr_scene_node *second_branch = second;
+	while (first_depth > second_depth) {
+		first_branch = &first_branch->parent->node;
+		first_depth--;
+	}
+	while (second_depth > first_depth) {
+		second_branch = &second_branch->parent->node;
+		second_depth--;
+	}
+	if (first_branch == second_branch) {
+		return 0;
+	}
+	while (first_branch->parent != second_branch->parent) {
+		if (first_branch->parent == NULL || second_branch->parent == NULL) {
+			return 0;
+		}
+		first_branch = &first_branch->parent->node;
+		second_branch = &second_branch->parent->node;
+	}
+	if (first_branch->parent == NULL) {
+		return 0;
+	}
+
+	struct wlr_scene_node *node;
+	wl_list_for_each(node, &first_branch->parent->children, link) {
+		if (node == first_branch) {
+			return -1;
+		}
+		if (node == second_branch) {
+			return 1;
+		}
+	}
+	return 0;
 }
 
 static bool scene_node_invisible(struct wlr_scene_node *node) {
@@ -1977,10 +2346,9 @@ static bool construct_render_list_iterator(struct wlr_scene_node *node,
 
 	*entry = (struct render_list_entry){
 		.node = node,
-		.x = lx,
-		.y = ly,
 		.highlight_transparent_region = data->highlight_transparent_region,
 	};
+	wlr_scene_node_coords_f64(node, &entry->x, &entry->y);
 
 	return false;
 }
@@ -2024,6 +2392,24 @@ static void scene_buffer_send_dmabuf_feedback(const struct wlr_scene *scene,
 	wlr_linux_dmabuf_feedback_v1_finish(&feedback);
 }
 
+struct scene_output_layer_feedback_context {
+	struct wl_listener listener;
+	struct wlr_scene_output *scene_output;
+	struct wlr_scene_buffer *buffer;
+};
+
+static void scene_output_layer_feedback(struct wl_listener *listener, void *data) {
+	struct scene_output_layer_feedback_context *context =
+		wl_container_of(listener, context, listener);
+	const struct wlr_output_layer_feedback_event *event = data;
+	struct wlr_linux_dmabuf_feedback_v1_init_options options = {
+		.main_renderer = context->scene_output->output->renderer,
+		.output_layer_feedback_event = event,
+	};
+	scene_buffer_send_dmabuf_feedback(context->scene_output->scene,
+		context->buffer, &options);
+}
+
 static bool color_management_is_scanout_allowed(const struct wlr_output_image_description *img_desc,
 		const struct wlr_scene_buffer *buffer) {
 	// Disallow scanout if the output has colorimetry information but buffer
@@ -2057,6 +2443,73 @@ enum scene_direct_scanout_result {
 	// Scanout is successful.
 	SCANOUT_SUCCESS,
 };
+
+static struct wlr_buffer *scene_buffer_get_scanout_source(
+		struct wlr_scene_buffer *buffer) {
+	struct wlr_buffer *wlr_buffer = buffer->buffer;
+	struct wlr_client_buffer *client_buffer = wlr_client_buffer_get(wlr_buffer);
+	if (client_buffer != NULL && client_buffer->source != NULL &&
+			client_buffer->source->n_locks > 0) {
+		return client_buffer->source;
+	}
+	return wlr_buffer;
+}
+
+static bool scene_color_pipeline_available(struct wlr_output *output) {
+#if WLR_HAS_DRM_BACKEND
+	return wlr_drm_output_supports_color_pipeline(output);
+#else
+	return false;
+#endif
+}
+
+static struct wlr_buffer *scene_buffer_color_pipeline(struct wlr_scene_buffer *buffer,
+	struct wlr_output *output, const struct wlr_output_image_description *desc) {
+	if (!scene_color_pipeline_available(output) || buffer->opacity != 1.0f || buffer->force_blend) {
+		return NULL;
+	}
+	enum wlr_color_transfer_function src_tf =
+		buffer->transfer_function ? buffer->transfer_function : WLR_COLOR_TRANSFER_FUNCTION_GAMMA22;
+	enum wlr_color_transfer_function dst_tf =
+		desc ? desc->transfer_function : WLR_COLOR_TRANSFER_FUNCTION_GAMMA22;
+	struct color_pipeline_recipe recipe = {0};
+	if (!color_pipeline_add_decode(&recipe, src_tf)) {
+		return NULL;
+	}
+	struct wlr_color_primaries src, working, dst;
+	wlr_color_primaries_from_named(
+		&src, buffer->primaries ? buffer->primaries : WLR_COLOR_NAMED_PRIMARIES_SRGB);
+	wlr_color_primaries_from_named(&working, WLR_COLOR_NAMED_PRIMARIES_SRGB);
+	wlr_color_primaries_from_named(&dst, desc ? desc->primaries : WLR_COLOR_NAMED_PRIMARIES_SRGB);
+	float matrix[9];
+	wlr_color_primaries_transform_absolute_colorimetric(&src, &working, matrix);
+	float gain = scene_buffer_luminance(buffer, desc);
+	for (size_t i = 0; i < 9; i++) {
+		matrix[i] *= gain;
+	}
+	if (!color_pipeline_add_matrix(&recipe, matrix)) {
+		return NULL;
+	}
+	wlr_color_primaries_transform_absolute_colorimetric(&working, &dst, matrix);
+	struct wlr_color_luminances working_lum, dst_lum;
+	wlr_color_transfer_function_get_default_luminance(
+		WLR_COLOR_TRANSFER_FUNCTION_SRGB, &working_lum);
+	wlr_color_transfer_function_get_default_luminance(dst_tf, &dst_lum);
+	gain = get_luminance_multiplier(&working_lum, &dst_lum);
+	for (size_t i = 0; i < 9; i++) {
+		matrix[i] *= gain;
+	}
+	if (!color_pipeline_add_matrix(&recipe, matrix)) {
+		return NULL;
+	}
+	struct wlr_color_transform *encode = wlr_color_transform_init_linear_to_inverse_eotf(dst_tf);
+	if (!encode) {
+		return NULL;
+	}
+	bool ok = color_pipeline_add_transform(&recipe, encode);
+	wlr_color_transform_unref(encode);
+	return ok ? color_pipeline_wrap(scene_buffer_get_scanout_source(buffer), &recipe) : NULL;
+}
 
 static enum scene_direct_scanout_result scene_entry_try_direct_scanout(
 		struct render_list_entry *entry, struct wlr_output_state *state,
@@ -2102,7 +2555,8 @@ static enum scene_direct_scanout_result scene_entry_try_direct_scanout(
 	}
 
 	const struct wlr_output_image_description *img_desc = output_pending_image_description(scene_output->output, state);
-	if (!color_management_is_scanout_allowed(img_desc, buffer)) {
+	bool needs_color_pipeline = !color_management_is_scanout_allowed(img_desc, buffer);
+	if (needs_color_pipeline && !scene_color_pipeline_available(scene_output->output)) {
 		return SCANOUT_INELIGIBLE;
 	}
 
@@ -2140,19 +2594,42 @@ static enum scene_direct_scanout_result scene_entry_try_direct_scanout(
 	}
 
 	// Translate the position from scene coordinates to output coordinates
-	pending.buffer_dst_box.x = entry->x - scene_output->x;
-	pending.buffer_dst_box.y = entry->y - scene_output->y;
+	double x = entry->x - scene_output->x;
+	double y = entry->y - scene_output->y;
+	int width, height;
+	scene_node_get_size(node, &width, &height);
+	transform_output_fbox(&pending.buffer_dst_box, x, y, width, height, data);
 
-	scene_node_get_size(node, &pending.buffer_dst_box.width, &pending.buffer_dst_box.height);
-	transform_output_box(&pending.buffer_dst_box, data);
+	struct wlr_buffer *wlr_buffer = scene_buffer_get_scanout_source(buffer);
 
-	struct wlr_buffer *wlr_buffer = buffer->buffer;
-	struct wlr_client_buffer *client_buffer = wlr_client_buffer_get(wlr_buffer);
-	if (client_buffer != NULL && client_buffer->source != NULL && client_buffer->source->n_locks > 0) {
-		wlr_buffer = client_buffer->source;
+	struct wlr_buffer *color_buffer = NULL;
+	if (needs_color_pipeline) {
+		color_buffer = scene_buffer_color_pipeline(buffer, scene_output->output, img_desc);
+		if (!color_buffer) {
+			wlr_output_state_finish(&pending);
+			return SCANOUT_INELIGIBLE;
+		}
+		uint64_t key = color_pipeline_fingerprint(color_pipeline_get(color_buffer));
+		struct wlr_dmabuf_attributes attrs;
+		if (wlr_buffer_get_dmabuf(color_buffer, &attrs)) {
+			key ^= ((uint64_t)attrs.format << 32) ^ attrs.modifier;
+		}
+		key ^= ((uint64_t)color_buffer->width << 32) ^ (uint32_t)color_buffer->height;
+		if (scene_output->color_pipeline_scanout_key == key &&
+			scene_output->color_pipeline_scanout_retry_frames > 0) {
+			scene_output->color_pipeline_scanout_retry_frames--;
+			wlr_buffer_drop(color_buffer);
+			wlr_output_state_finish(&pending);
+			return SCANOUT_CANDIDATE;
+		}
+		scene_output->color_pipeline_scanout_key = key;
+		scene_output->color_pipeline_scanout_retry_frames = 0;
+		wlr_buffer = color_buffer;
 	}
-
 	wlr_output_state_set_buffer(&pending, wlr_buffer);
+	if (color_buffer) {
+		wlr_buffer_drop(color_buffer);
+	}
 	if (buffer->wait_timeline != NULL) {
 		wlr_output_state_set_wait_timeline(&pending, buffer->wait_timeline, buffer->wait_point);
 	}
@@ -2163,6 +2640,8 @@ static enum scene_direct_scanout_result scene_entry_try_direct_scanout(
 	}
 
 	if (!wlr_output_test_state(scene_output->output, &pending)) {
+		if (needs_color_pipeline)
+			scene_output->color_pipeline_scanout_retry_frames = 120;
 		wlr_output_state_finish(&pending);
 		return SCANOUT_CANDIDATE;
 	}
@@ -2178,6 +2657,186 @@ static enum scene_direct_scanout_result scene_entry_try_direct_scanout(
 	};
 	wl_signal_emit_mutable(&buffer->events.output_sample, &sample_event);
 	return SCANOUT_SUCCESS;
+}
+
+static bool scene_entry_try_output_layer(struct render_list_entry *candidate_entry,
+		struct render_list_entry *list_data, int list_len,
+		struct wlr_scene_output_layer_candidate *candidate,
+		struct wlr_output_state *state, const struct render_data *data) {
+	struct wlr_scene_output *scene_output = data->output;
+	struct wlr_scene_node *node = candidate_entry->node;
+
+	if (node->type != WLR_SCENE_NODE_BUFFER) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_WRONG_NODE;
+		return false;
+	}
+	if (data->scale != 1.0f) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_SCALED;
+		return false;
+	}
+	if (data->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_TRANSFORMED;
+		return false;
+	}
+	if (state->committed & (WLR_OUTPUT_STATE_MODE |
+			WLR_OUTPUT_STATE_ENABLED | WLR_OUTPUT_STATE_RENDER_FORMAT)) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_OUTPUT_STATE;
+		return false;
+	}
+	if (!wlr_output_is_direct_scanout_allowed(scene_output->output)) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_CAPTURE_ACTIVE;
+		return false;
+	}
+	if (scene_output->output->software_cursor_locks > 0) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_SOFTWARE_CURSOR;
+		return false;
+	}
+
+	struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
+	if (buffer != candidate->buffer || buffer->buffer == NULL) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_NO_BUFFER;
+		return false;
+	}
+	if (buffer->opacity != 1.0f || buffer->force_blend) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_NOT_OPAQUE;
+		return false;
+	}
+	if (buffer->transform != WL_OUTPUT_TRANSFORM_NORMAL) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_TRANSFORMED;
+		return false;
+	}
+	if (!wlr_fbox_empty(&buffer->src_box)) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_CLIPPED;
+		return false;
+	}
+
+	if (scene_output->buffer_render_hook != NULL &&
+			(scene_output->buffer_needs_composition == NULL ||
+			scene_output->buffer_needs_composition(buffer,
+				scene_output->render_hook_data))) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_EFFECTS;
+		return false;
+	}
+
+	const struct wlr_output_image_description *img_desc =
+		output_pending_image_description(scene_output->output, state);
+	bool needs_color_pipeline = !color_management_is_scanout_allowed(img_desc, buffer);
+	if (needs_color_pipeline && !scene_color_pipeline_available(scene_output->output)) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_COLOR;
+		return false;
+	}
+
+	bool is_color_repr_none = buffer->color_encoding == WLR_COLOR_ENCODING_NONE &&
+		buffer->color_range == WLR_COLOR_RANGE_NONE;
+	bool is_color_repr_identity_full =
+		buffer->color_encoding == WLR_COLOR_ENCODING_IDENTITY &&
+		buffer->color_range == WLR_COLOR_RANGE_FULL;
+	if (!(is_color_repr_none || is_color_repr_identity_full)) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_COLOR;
+		return false;
+	}
+
+	int width, height;
+	scene_node_get_size(node, &width, &height);
+	if (width != buffer->buffer->width || height != buffer->buffer->height ||
+			candidate_entry->x != floor(candidate_entry->x) ||
+			candidate_entry->y != floor(candidate_entry->y)) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_SCALED;
+		return false;
+	}
+
+	struct wlr_box scene_box = {
+		.x = candidate_entry->x,
+		.y = candidate_entry->y,
+		.width = width,
+		.height = height,
+	};
+	if (!wlr_box_contains_box(&data->logical, &scene_box)) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_OUTSIDE_OUTPUT;
+		return false;
+	}
+
+	pixman_region32_t opaque;
+	pixman_region32_init(&opaque);
+	scene_node_opaque_region(node, scene_box.x, scene_box.y, &opaque);
+	pixman_box32_t opaque_box = {
+		.x1 = scene_box.x,
+		.y1 = scene_box.y,
+		.x2 = scene_box.x + scene_box.width,
+		.y2 = scene_box.y + scene_box.height,
+	};
+	bool fully_opaque = pixman_region32_contains_rectangle(&opaque, &opaque_box) ==
+		PIXMAN_REGION_IN;
+	pixman_region32_fini(&opaque);
+	if (!fully_opaque) {
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_NOT_OPAQUE;
+		return false;
+	}
+
+	int candidate_index = candidate_entry - list_data;
+	for (int i = 0; i < candidate_index; i++) {
+		struct wlr_scene_node *other = list_data[i].node;
+
+		pixman_region32_t overlap;
+		pixman_region32_init_rect(&overlap, scene_box.x, scene_box.y,
+			scene_box.width, scene_box.height);
+		pixman_region32_intersect(&overlap, &overlap, &other->visible);
+		bool intersects = !pixman_region32_empty(&overlap);
+		pixman_region32_fini(&overlap);
+		if (intersects) {
+			candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_INTERSECTED;
+			return false;
+		}
+	}
+
+	struct wlr_output_layer_state *layer_state = &candidate->state;
+	struct wlr_buffer *color_buffer = NULL;
+	if (needs_color_pipeline) {
+		color_buffer = scene_buffer_color_pipeline(buffer, scene_output->output, img_desc);
+		if (!color_buffer) {
+			candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_COLOR;
+			return false;
+		}
+	}
+	layer_state->buffer = color_buffer ? color_buffer : scene_buffer_get_scanout_source(buffer);
+	transform_output_fbox(&layer_state->dst_box,
+		candidate_entry->x - scene_output->x,
+		candidate_entry->y - scene_output->y, width, height, data);
+	if (buffer->wait_timeline != NULL) {
+		layer_state->wait_timeline = buffer->wait_timeline;
+		layer_state->wait_point = buffer->wait_point;
+	}
+
+	struct scene_output_layer_feedback_context feedback = {
+		.listener = { .notify = scene_output_layer_feedback },
+		.scene_output = scene_output,
+		.buffer = buffer,
+	};
+	wl_signal_add(&candidate->layer->events.feedback, &feedback.listener);
+	layer_state->must_scan_out = true;
+	candidate->tested = true;
+	bool test_ok = wlr_output_test_state(scene_output->output, state);
+	wl_list_remove(&feedback.listener.link);
+	if (!test_ok || !layer_state->accepted) {
+		if (color_buffer) {
+			wlr_buffer_drop(color_buffer);
+		}
+		layer_state->buffer = NULL;
+		layer_state->must_scan_out = false;
+		layer_state->wait_timeline = NULL;
+		layer_state->wait_point = 0;
+		layer_state->accepted = false;
+		candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_BACKEND_TEST;
+		return false;
+	}
+
+	if (scene_output->out_timeline != NULL) {
+		scene_output->out_point++;
+		layer_state->signal_timeline = scene_output->out_timeline;
+		layer_state->signal_point = scene_output->out_point;
+	}
+
+	return true;
 }
 
 bool wlr_scene_output_needs_frame(struct wlr_scene_output *scene_output) {
@@ -2310,11 +2969,104 @@ cleanup_transforms:
 	return result;
 }
 
+/* Keep scene effects in their existing linear working space. The scanout
+ * wrapper describes only the final output transform, never capture metadata. */
+static struct wlr_buffer *scene_output_try_color_pipeline(
+	struct wlr_scene_output *so, struct wlr_output_state *state, int width, int height) {
+#if WLR_HAS_VULKAN_RENDERER
+	struct wlr_output *output = so->output;
+	if (!scene_color_pipeline_available(output) || !wlr_renderer_is_vk(output->renderer) ||
+		!wlr_output_is_direct_scanout_allowed(output) || output->software_cursor_locks > 0) {
+		return NULL;
+	}
+	if (so->color_pipeline_retry_frames &&
+		!(state->committed & (WLR_OUTPUT_STATE_MODE | WLR_OUTPUT_STATE_IMAGE_DESCRIPTION))) {
+		so->color_pipeline_retry_frames--;
+		return NULL;
+	}
+	so->color_pipeline_retry_frames = 120;
+	struct color_pipeline_recipe recipe = {0};
+	if (!color_pipeline_add_transform(&recipe, so->combined_color_transform) || !recipe.len) {
+		return NULL;
+	}
+	if (!so->color_pipeline_identity) {
+		so->color_pipeline_identity =
+			wlr_color_transform_init_linear_to_inverse_eotf(WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR);
+		if (!so->color_pipeline_identity) {
+			return NULL;
+		}
+	}
+	struct wlr_swapchain *swapchain = so->color_pipeline_swapchain;
+	if (!swapchain || swapchain->width != width || swapchain->height != height) {
+		const struct wlr_drm_format_set *formats =
+			wlr_output_get_primary_formats(output, output->allocator->buffer_caps);
+		struct wlr_drm_format format = {0};
+		if (!output_pick_format(output, formats, &format, DRM_FORMAT_XBGR16161616F)) {
+			return NULL;
+		}
+		swapchain = wlr_swapchain_create(output->allocator, width, height, &format);
+		wlr_drm_format_finish(&format);
+		if (!swapchain) {
+			return NULL;
+		}
+		wlr_swapchain_destroy(so->color_pipeline_swapchain);
+		so->color_pipeline_swapchain = swapchain;
+	}
+	struct wlr_buffer *buffer = wlr_swapchain_acquire(swapchain);
+	if (!buffer) {
+		return NULL;
+	}
+	struct wlr_buffer *wrapped = color_pipeline_wrap(buffer, &recipe);
+	struct wlr_output_state pending;
+	wlr_output_state_init(&pending);
+	bool ok = wrapped && wlr_output_state_copy(&pending, state);
+	if (ok) {
+		wlr_output_state_set_buffer(&pending, wrapped);
+		ok = wlr_output_test_state(output, &pending);
+	}
+	if (ok) {
+		wlr_output_state_set_buffer(state, wrapped);
+		so->color_pipeline_retry_frames = 0;
+	}
+	wlr_output_state_finish(&pending);
+	if (wrapped) {
+		wlr_buffer_drop(wrapped);
+	}
+	if (!ok) {
+		wlr_buffer_unlock(buffer);
+		return NULL;
+	}
+	return buffer;
+#else
+	return NULL;
+#endif
+}
+
 bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 		struct wlr_output_state *state, const struct wlr_scene_output_state_options *options) {
 	struct wlr_scene_output_state_options default_options = {0};
 	if (!options) {
 		options = &default_options;
+	}
+	struct wlr_scene_output_layer_candidate *layer_candidate =
+		options->layer_candidate;
+	if (layer_candidate != NULL) {
+		layer_candidate->promoted = false;
+		layer_candidate->tested = false;
+		layer_candidate->rejection_reason = WLR_SCENE_OUTPUT_LAYER_REJECTION_NO_BUFFER;
+		layer_candidate->scene_output = scene_output;
+		layer_candidate->state = (struct wlr_output_layer_state){
+			.layer = layer_candidate->layer,
+		};
+		if (layer_candidate->layer != NULL) {
+			wlr_output_state_set_layers(state, &layer_candidate->state, 1);
+		}
+	}
+	if ((state->committed & (WLR_OUTPUT_STATE_MODE | WLR_OUTPUT_STATE_IMAGE_DESCRIPTION |
+								WLR_OUTPUT_STATE_ENABLED)) ||
+		!wlr_output_is_direct_scanout_allowed(scene_output->output)) {
+		scene_output->color_pipeline_scanout_retry_frames = 0;
+		scene_output->color_pipeline_retry_frames = 0;
 	}
 	struct wlr_scene_timer *timer = options->timer;
 	struct timespec start_time;
@@ -2349,6 +3101,12 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 		.logical = { .x = scene_output->x, .y = scene_output->y },
 		.output = scene_output,
 	};
+
+	// Aqueous: expose the pending output image description to per-buffer
+	// rendering so SDR content can be scaled to the configured SDR white
+	// level on HDR outputs.
+	render_data.output_image_description =
+		output_pending_image_description(output, state);
 
 	int resolution_width, resolution_height;
 	output_pending_resolution(output, state,
@@ -2443,7 +3201,18 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 	// - There are no color transforms that need to be applied
 	// - Damage highlight debugging is not enabled
 	enum scene_direct_scanout_result scanout_result = SCANOUT_INELIGIBLE;
-	if (options->color_transform == NULL && !render_gamma_lut && list_len == 1
+	bool render_hook_needs_composition = false;
+	if (list_len == 1 && scene_output->buffer_render_hook != NULL &&
+			list_data[0].node->type == WLR_SCENE_NODE_BUFFER) {
+		struct wlr_scene_buffer *scene_buffer =
+			wlr_scene_buffer_from_node(list_data[0].node);
+		render_hook_needs_composition =
+			scene_output->buffer_needs_composition == NULL ||
+			scene_output->buffer_needs_composition(scene_buffer,
+				scene_output->render_hook_data);
+	}
+	if (!render_hook_needs_composition &&
+			options->color_transform == NULL && !render_gamma_lut && list_len == 1
 			&& debug_damage != WLR_SCENE_DEBUG_DAMAGE_HIGHLIGHT) {
 		scanout_result = scene_entry_try_direct_scanout(&list_data[0], state, &render_data);
 	}
@@ -2467,6 +3236,9 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 	}
 
 	if (scanout) {
+		if (layer_candidate != NULL && layer_candidate->previously_promoted) {
+			scene_output_damage_whole(scene_output);
+		}
 		scene_output_state_attempt_gamma(scene_output, state);
 
 		if (timer) {
@@ -2478,21 +3250,90 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 		return true;
 	}
 
-	struct wlr_swapchain *swapchain = options->swapchain;
-	if (!swapchain) {
-		if (!wlr_output_configure_primary_swapchain(output, state, &output->swapchain)) {
+	if (scene_output->combined_color_transform == NULL ||
+		(render_gamma_lut && scene_output->gamma_lut_color_transform !=
+								 scene_output->prev_gamma_lut_color_transform) ||
+		scene_output->prev_supplied_color_transform != options->color_transform ||
+		(state->committed & WLR_OUTPUT_STATE_IMAGE_DESCRIPTION)) {
+		const struct wlr_output_image_description *output_description =
+			output_pending_image_description(output, state);
+		if (!scene_output_combine_color_transforms(
+				scene_output, options->color_transform, output_description, render_gamma_lut)) {
+			if (layer_candidate) {
+				wlr_scene_output_layer_candidate_finish(layer_candidate, false);
+			}
+			return false;
+		}
+	}
+
+	struct wlr_buffer *buffer = NULL;
+	if (!options->swapchain && !render_gamma_lut &&
+		(!layer_candidate || !layer_candidate->buffer) && !options->color_transform) {
+		buffer = scene_output_try_color_pipeline(
+			scene_output, state, resolution_width, resolution_height);
+	}
+	bool color_offload = buffer != NULL;
+	if (scene_output->color_pipeline_composed != color_offload) {
+		scene_output_damage_whole(scene_output);
+		scene_output->color_pipeline_composed = color_offload;
+	}
+	if (!color_offload) {
+		struct wlr_swapchain *swapchain = options->swapchain;
+		if (!swapchain) {
+			if (!wlr_output_configure_primary_swapchain(output, state, &output->swapchain)) {
+				if (layer_candidate) {
+					wlr_scene_output_layer_candidate_finish(layer_candidate, false);
+				}
+				return false;
+			}
+
+			swapchain = output->swapchain;
+		}
+
+		buffer = wlr_swapchain_acquire(swapchain);
+		if (buffer == NULL) {
+			if (layer_candidate) {
+				wlr_scene_output_layer_candidate_finish(layer_candidate, false);
+			}
 			return false;
 		}
 
-		swapchain = output->swapchain;
+		assert(buffer->width == resolution_width && buffer->height == resolution_height);
+		wlr_output_state_set_buffer(state, buffer);
 	}
 
-	struct wlr_buffer *buffer = wlr_swapchain_acquire(swapchain);
-	if (buffer == NULL) {
-		return false;
+	if (!wlr_output_uses_presentation_copy(output) &&
+			layer_candidate != NULL && layer_candidate->layer != NULL &&
+			layer_candidate->buffer != NULL && options->color_transform == NULL &&
+			!render_gamma_lut &&
+			debug_damage != WLR_SCENE_DEBUG_DAMAGE_HIGHLIGHT) {
+		struct render_list_entry *candidate_entry = NULL;
+		for (int i = 0; i < list_len; i++) {
+			if (list_data[i].node->type == WLR_SCENE_NODE_BUFFER &&
+					wlr_scene_buffer_from_node(list_data[i].node) ==
+					layer_candidate->buffer) {
+				candidate_entry = &list_data[i];
+				break;
+			}
+		}
+
+		if (candidate_entry != NULL) {
+			layer_candidate->promoted = scene_entry_try_output_layer(
+				candidate_entry, list_data, list_len, layer_candidate,
+				state, &render_data);
+		}
+	} else if (layer_candidate != NULL && layer_candidate->buffer != NULL) {
+		layer_candidate->rejection_reason =
+			WLR_SCENE_OUTPUT_LAYER_REJECTION_EFFECTS;
 	}
 
-	assert(buffer->width == resolution_width && buffer->height == resolution_height);
+	if (layer_candidate != NULL &&
+			layer_candidate->previously_promoted != layer_candidate->promoted) {
+		scene_output_damage_whole(scene_output);
+		wlr_output_state_set_damage(state, &scene_output->pending_commit_damage);
+		wlr_log(WLR_DEBUG, "Output layer promotion %s",
+			layer_candidate->promoted ? "enabled" : "disabled");
+	}
 
 	if (timer) {
 		timer->render_timer = wlr_render_timer_create(output->renderer);
@@ -2503,33 +3344,47 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 		timer->pre_render_duration = timespec_to_nsec(&duration);
 	}
 
-	if ((render_gamma_lut
-			&& scene_output->gamma_lut_color_transform != scene_output->prev_gamma_lut_color_transform)
-			|| scene_output->prev_supplied_color_transform != options->color_transform
-			|| (state->committed & WLR_OUTPUT_STATE_IMAGE_DESCRIPTION)) {
-		const struct wlr_output_image_description *output_description =
-			output_pending_image_description(output, state);
-		if (!scene_output_combine_color_transforms(scene_output, options->color_transform,
-				output_description, render_gamma_lut)) {
-			wlr_buffer_unlock(buffer);
-			return false;
-		}
-	}
 
 	scene_output->in_point++;
 	struct wlr_render_pass *render_pass = wlr_renderer_begin_buffer_pass(output->renderer, buffer,
-			&(struct wlr_buffer_pass_options){
-		.timer = timer ? timer->render_timer : NULL,
-		.color_transform = scene_output->combined_color_transform,
-		.signal_timeline = scene_output->in_timeline,
-		.signal_point = scene_output->in_point,
-	});
+		&(struct wlr_buffer_pass_options){
+			.timer = timer ? timer->render_timer : NULL,
+			.color_transform = color_offload ? scene_output->color_pipeline_identity
+											 : scene_output->combined_color_transform,
+			.signal_timeline = scene_output->in_timeline,
+			.signal_point = scene_output->in_point,
+		});
 	if (render_pass == NULL) {
 		wlr_buffer_unlock(buffer);
+		if (layer_candidate) {
+			wlr_scene_output_layer_candidate_finish(layer_candidate, false);
+		}
 		return false;
 	}
 
 	render_data.render_pass = render_pass;
+
+	if (scene_output->render_begin_hook != NULL) {
+		uint32_t damage_expansion = scene_output->render_begin_hook(
+			render_pass, &scene_output->pending_effect_damage,
+			scene_output->render_hook_data);
+		if (damage_expansion > 0 &&
+				!pixman_region32_empty(&scene_output->pending_effect_damage)) {
+			pixman_region32_t expanded_effect_damage;
+			pixman_region32_init(&expanded_effect_damage);
+			wlr_region_expand(&expanded_effect_damage,
+				&scene_output->pending_effect_damage, damage_expansion);
+			pixman_region32_intersect_rect(&expanded_effect_damage,
+				&expanded_effect_damage, 0, 0, buffer->width, buffer->height);
+			wlr_damage_ring_add(&scene_output->damage_ring,
+				&expanded_effect_damage);
+			pixman_region32_union(&scene_output->pending_commit_damage,
+				&scene_output->pending_commit_damage, &expanded_effect_damage);
+			wlr_output_state_set_damage(state,
+				&scene_output->pending_commit_damage);
+			pixman_region32_fini(&expanded_effect_damage);
+		}
+	}
 
 	pixman_region32_init(&render_data.damage);
 	wlr_damage_ring_rotate_buffer(&scene_output->damage_ring, buffer,
@@ -2580,6 +3435,12 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 
 	for (int i = list_len - 1; i >= 0; i--) {
 		struct render_list_entry *entry = &list_data[i];
+		if (layer_candidate != NULL && layer_candidate->promoted &&
+				entry->node->type == WLR_SCENE_NODE_BUFFER &&
+				wlr_scene_buffer_from_node(entry->node) ==
+				layer_candidate->buffer) {
+			continue;
+		}
 		scene_entry_render(entry, &render_data);
 
 		if (entry->node->type == WLR_SCENE_NODE_BUFFER) {
@@ -2625,10 +3486,15 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 		// if we failed to render the buffer, it will have undefined contents
 		// Trash the damage ring
 		wlr_damage_ring_add_whole(&scene_output->damage_ring);
+		if (layer_candidate) {
+			wlr_scene_output_layer_candidate_finish(layer_candidate, false);
+		}
 		return false;
 	}
 
-	wlr_output_state_set_buffer(state, buffer);
+	if (!color_offload) {
+		wlr_output_state_set_buffer(state, buffer);
+	}
 	wlr_buffer_unlock(buffer);
 
 	if (scene_output->in_timeline != NULL) {
@@ -2644,6 +3510,25 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 	}
 
 	return true;
+}
+
+void wlr_scene_output_layer_candidate_finish(
+		struct wlr_scene_output_layer_candidate *candidate, bool committed) {
+	if (color_pipeline_get(candidate->state.buffer)) {
+		wlr_buffer_drop(candidate->state.buffer);
+		candidate->state.buffer = NULL;
+	}
+	if (!committed || !candidate->promoted || candidate->buffer == NULL ||
+			candidate->scene_output == NULL) {
+		return;
+	}
+	struct wlr_scene_output_sample_event sample_event = {
+		.output = candidate->scene_output,
+		.direct_scanout = true,
+		.release_timeline = candidate->state.signal_timeline,
+		.release_point = candidate->state.signal_point,
+	};
+	wl_signal_emit_mutable(&candidate->buffer->events.output_sample, &sample_event);
 }
 
 int64_t wlr_scene_timer_get_duration_ns(struct wlr_scene_timer *timer) {

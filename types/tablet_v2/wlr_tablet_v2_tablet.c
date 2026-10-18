@@ -1,4 +1,9 @@
 #include <assert.h>
+#include <wlr/config.h>
+#include "config.h"
+#if WLR_HAS_LIBINPUT_BACKEND && HAVE_LIBINPUT_BUSTYPE
+#include <wlr/backend/libinput.h>
+#endif
 #include <stdlib.h>
 #include <types/wlr_tablet_v2.h>
 #include <wayland-util.h>
@@ -116,6 +121,16 @@ void add_tablet_client(struct wlr_tablet_seat_client_v2 *seat,
 		zwp_tablet_v2_send_path(client->resource, *path_ptr);
 	}
 
+#if WLR_HAS_LIBINPUT_BACKEND && HAVE_LIBINPUT_BUSTYPE
+	if (version >= ZWP_TABLET_V2_BUSTYPE_SINCE_VERSION &&
+			wlr_input_device_is_libinput(tablet->wlr_device)) {
+		struct libinput_device *device = wlr_libinput_get_device_handle(tablet->wlr_device);
+		unsigned int bustype = libinput_device_get_id_bustype(device);
+		if (bustype != 0) {
+			zwp_tablet_v2_send_bustype(client->resource, bustype);
+		}
+	}
+#endif
 	zwp_tablet_v2_send_done(client->resource);
 
 	client->client = seat->wl_client;

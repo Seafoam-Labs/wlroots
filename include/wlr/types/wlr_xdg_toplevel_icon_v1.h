@@ -9,6 +9,8 @@
 #ifndef WLR_TYPES_WLR_XDG_TOPLEVEL_ICON_V1_H
 #define WLR_TYPES_WLR_XDG_TOPLEVEL_ICON_V1_H
 
+#define WLR_AQUEOUS_TOPLEVEL_ICON_VERSION 1
+
 #include <wayland-server-core.h>
 
 #include <wlr/util/addon.h>

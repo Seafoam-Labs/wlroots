@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <wlr/types/wlr_fifo_v1.h>
+#include <math.h>
 #include <stdlib.h>
 #include <wlr/types/wlr_alpha_modifier_v1.h>
 #include <wlr/types/wlr_color_management_v1.h>
@@ -10,8 +12,39 @@
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_presentation_time.h>
 #include <wlr/types/wlr_single_pixel_buffer_v1.h>
+#include <wlr/util/region.h>
 #include <wlr/util/transform.h>
 #include "types/wlr_scene.h"
+
+struct scene_surface_destination_scale {
+	struct wlr_addon addon;
+	double scale;
+};
+
+static void destination_scale_destroy(struct wlr_addon *addon) {
+	struct scene_surface_destination_scale *state =
+		wl_container_of(addon, state, addon);
+	wlr_addon_finish(&state->addon);
+	free(state);
+}
+
+static const struct wlr_addon_interface destination_scale_impl = {
+	.name = "wlr_scene_surface_destination_scale",
+	.destroy = destination_scale_destroy,
+};
+
+static double scene_surface_destination_scale(
+		struct wlr_scene_surface *scene_surface) {
+	struct wlr_addon *addon = wlr_addon_find(
+		&scene_surface->buffer->node.addons, scene_surface,
+		&destination_scale_impl);
+	if (addon == NULL) {
+		return 1.0;
+	}
+	struct scene_surface_destination_scale *state =
+		wl_container_of(addon, state, addon);
+	return state->scale;
+}
 
 static double get_surface_preferred_buffer_scale(struct wlr_surface *surface) {
 	double scale = 1;
@@ -22,6 +55,15 @@ static double get_surface_preferred_buffer_scale(struct wlr_surface *surface) {
 		}
 	}
 	return scale;
+}
+
+static double get_surface_effective_preferred_scale(
+		struct wlr_surface *surface) {
+	double override = wlr_surface_get_preferred_scale_override(surface);
+	if (override > 0.0) {
+		return override;
+	}
+	return get_surface_preferred_buffer_scale(surface);
 }
 
 // Output used for frame pacing (surface frame callbacks, presentation
@@ -100,6 +142,7 @@ static void handle_scene_buffer_outputs_update(
 	// If the surface is no longer visible on any output in the scene, keep the
 	// last sent preferred configuration to avoid unnecessary redraws
 	bool suspend = event->size == 0;
+	wlr_fifo_v1_surface_changed(surface->surface);
 
 	// To avoid sending redundant leave/enter events when a surface is hidden and then shown
 	// without moving to a different output the following policy is implemented:
@@ -143,7 +186,9 @@ static void handle_scene_buffer_outputs_update(
 		wlr_surface_send_enter(surface->surface, event->active[i]->output);
 	}
 
-	double scale = get_surface_preferred_buffer_scale(surface->surface);
+	double destination_scale = scene_surface_destination_scale(surface);
+	double scale = destination_scale == 1.0 ?
+		get_surface_effective_preferred_scale(surface->surface) : 1.0;
 	wlr_fractional_scale_v1_notify_scale(surface->surface, scale);
 	wlr_surface_set_preferred_buffer_scale(surface->surface, ceil(scale));
 
@@ -309,9 +354,28 @@ static void surface_reconfigure(struct wlr_scene_surface *scene_surface) {
 		}
 	}
 
-	wlr_scene_buffer_set_opaque_region(scene_buffer, &opaque);
+	pixman_region32_t projected_opaque;
+	pixman_region32_init(&projected_opaque);
+	double destination_scale = scene_surface_destination_scale(scene_surface);
+	if (destination_scale != 1.0) {
+		float inverse_scale = 1.0f / (float)destination_scale;
+		wlr_region_scale_xy(&projected_opaque, &opaque,
+			inverse_scale, inverse_scale);
+	} else {
+		pixman_region32_copy(&projected_opaque, &opaque);
+	}
+
+	int destination_width = width;
+	int destination_height = height;
+	if (destination_scale != 1.0) {
+		destination_width = lround((double)width / destination_scale);
+		destination_height = lround((double)height / destination_scale);
+	}
+
+	wlr_scene_buffer_set_opaque_region(scene_buffer, &projected_opaque);
 	wlr_scene_buffer_set_source_box(scene_buffer, &src_box);
-	wlr_scene_buffer_set_dest_size(scene_buffer, width, height);
+	wlr_scene_buffer_set_dest_size(scene_buffer,
+		destination_width, destination_height);
 	wlr_scene_buffer_set_transform(scene_buffer, state->transform);
 	wlr_scene_buffer_set_opacity(scene_buffer, opacity);
 	wlr_scene_buffer_set_transfer_function(scene_buffer, tf);
@@ -355,6 +419,7 @@ static void surface_reconfigure(struct wlr_scene_surface *scene_surface) {
 	}
 
 	pixman_region32_fini(&opaque);
+	pixman_region32_fini(&projected_opaque);
 }
 
 static void handle_scene_surface_surface_commit(
@@ -383,8 +448,9 @@ static bool scene_buffer_point_accepts_input(struct wlr_scene_buffer *scene_buff
 	struct wlr_scene_surface *scene_surface =
 		wlr_scene_surface_try_from_buffer(scene_buffer);
 
-	*sx += scene_surface->clip.x;
-	*sy += scene_surface->clip.y;
+	double scale = scene_surface_destination_scale(scene_surface);
+	*sx = *sx * scale + scene_surface->clip.x;
+	*sy = *sy * scale + scene_surface->clip.y;
 
 	return wlr_surface_point_accepts_input(scene_surface->surface, *sx, *sy);
 }
@@ -460,6 +526,50 @@ struct wlr_scene_surface *wlr_scene_surface_create(struct wlr_scene_tree *parent
 	surface_reconfigure(surface);
 
 	return surface;
+}
+
+void wlr_scene_surface_set_destination_scale(
+		struct wlr_scene_surface *scene_surface, double scale) {
+	assert(scale > 0.0 && isfinite(scale));
+	struct wlr_addon *addon = wlr_addon_find(
+		&scene_surface->buffer->node.addons, scene_surface,
+		&destination_scale_impl);
+	if (addon != NULL) {
+		struct scene_surface_destination_scale *state =
+			wl_container_of(addon, state, addon);
+		if (state->scale == scale) {
+			return;
+		}
+		state->scale = scale;
+	} else if (scale != 1.0) {
+		struct scene_surface_destination_scale *state = calloc(1, sizeof(*state));
+		if (state == NULL) {
+			return;
+		}
+		state->scale = scale;
+		wlr_addon_init(&state->addon, &scene_surface->buffer->node.addons,
+			scene_surface, &destination_scale_impl);
+	} else {
+		return;
+	}
+	surface_reconfigure(scene_surface);
+	double preferred_scale = scale == 1.0 ?
+		get_surface_effective_preferred_scale(scene_surface->surface) : 1.0;
+	wlr_fractional_scale_v1_notify_scale(scene_surface->surface, preferred_scale);
+	wlr_surface_set_preferred_buffer_scale(scene_surface->surface, ceil(preferred_scale));
+}
+
+double wlr_scene_surface_get_destination_scale(
+		struct wlr_scene_surface *scene_surface) {
+	return scene_surface_destination_scale(scene_surface);
+}
+
+void wlr_scene_surface_map_point_to_destination(
+		struct wlr_scene_surface *scene_surface, double sx, double sy,
+		double *dx, double *dy) {
+	double scale = scene_surface_destination_scale(scene_surface);
+	*dx = (sx - scene_surface->clip.x) / scale;
+	*dy = (sy - scene_surface->clip.y) / scale;
 }
 
 void scene_surface_set_clip(struct wlr_scene_surface *surface, struct wlr_box *clip) {

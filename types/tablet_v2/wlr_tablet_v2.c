@@ -10,7 +10,7 @@
 #include <wlr/util/log.h>
 #include "tablet-v2-protocol.h"
 
-#define TABLET_MANAGER_VERSION 1
+#define TABLET_MANAGER_VERSION 2
 
 struct wlr_tablet_manager_client_v2 {
 	struct wl_list link;
@@ -150,7 +150,7 @@ static void get_tablet_seat(struct wl_client *wl_client, struct wl_resource *res
 		return;
 	}
 	struct wl_resource *tablet_seat_resource = wl_resource_create(wl_client,
-		&zwp_tablet_seat_v2_interface, TABLET_MANAGER_VERSION, id);
+		&zwp_tablet_seat_v2_interface, wl_resource_get_version(resource), id);
 	if (tablet_seat_resource == NULL) {
 		wl_client_post_no_memory(wl_client);
 		return;

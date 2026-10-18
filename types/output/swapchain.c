@@ -1,4 +1,9 @@
 #include <assert.h>
+#include <wlr/config.h>
+#include <wlr/types/wlr_output_presentation.h>
+#if WLR_HAS_VULKAN_RENDERER
+#include <wlr/render/vulkan.h>
+#endif
 #include <drm_fourcc.h>
 #include <stdlib.h>
 #include <wlr/render/allocator.h>
@@ -63,7 +68,7 @@ static bool test_swapchain(struct wlr_output *output,
 	return ok;
 }
 
-bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
+static bool configure_primary_swapchain(struct wlr_output *output,
 		const struct wlr_output_state *state, struct wlr_swapchain **swapchain_ptr) {
 	struct wlr_output_state empty_state;
 	if (state == NULL) {
@@ -81,7 +86,7 @@ bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
 
 	// Re-use the existing swapchain if possible
 	struct wlr_swapchain *old_swapchain = *swapchain_ptr;
-	if (old_swapchain != NULL &&
+	if (old_swapchain != NULL && old_swapchain->allocator == output->allocator &&
 			old_swapchain->width == width && old_swapchain->height == height &&
 			old_swapchain->format.format == format) {
 		return true;
@@ -115,4 +120,11 @@ bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
 	wlr_swapchain_destroy(*swapchain_ptr);
 	*swapchain_ptr = swapchain;
 	return true;
+}
+
+bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
+		const struct wlr_output_state *state, struct wlr_swapchain **swapchain_ptr) {
+	if (configure_primary_swapchain(output, state, swapchain_ptr)) return true;
+	if (!wlr_output_try_presentation_copy(output)) return false;
+	return configure_primary_swapchain(output, state, swapchain_ptr);
 }

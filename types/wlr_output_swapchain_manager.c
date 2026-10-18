@@ -1,4 +1,9 @@
 #include <assert.h>
+#include <wlr/config.h>
+#include <wlr/types/wlr_output_presentation.h>
+#if WLR_HAS_VULKAN_RENDERER
+#include <wlr/render/vulkan.h>
+#endif
 #include <drm_fourcc.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,10 +84,12 @@ static struct wlr_swapchain *manager_output_get_swapchain(
 		int width, int height, const struct wlr_drm_format *format) {
 	struct wlr_output *output = manager_output->output;
 
-	if (swapchain_is_compatible(output->swapchain, width, height, format)) {
+	if (output->swapchain && output->swapchain->allocator == output->allocator &&
+			swapchain_is_compatible(output->swapchain, width, height, format)) {
 		return output->swapchain;
 	}
-	if (swapchain_is_compatible(manager_output->new_swapchain, width, height, format)) {
+	if (manager_output->new_swapchain && manager_output->new_swapchain->allocator == output->allocator &&
+			swapchain_is_compatible(manager_output->new_swapchain, width, height, format)) {
 		return manager_output->new_swapchain;
 	}
 
@@ -177,7 +184,8 @@ static bool manager_test(struct wlr_output_swapchain_manager *manager,
 			return false;
 		}
 		if (!manager_output_prepare(manager_output, &state->base, explicit_modifiers)) {
-			return false;
+			if (!wlr_output_try_presentation_copy(state->output) ||
+					!manager_output_prepare(manager_output, &state->base, explicit_modifiers)) return false;
 		}
 	}
 

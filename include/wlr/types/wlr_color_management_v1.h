@@ -17,9 +17,19 @@
 struct wlr_renderer;
 struct wlr_surface;
 
+enum wlr_image_description_v1_kind {
+	WLR_IMAGE_DESCRIPTION_V1_PARAMETRIC,
+	WLR_IMAGE_DESCRIPTION_V1_WINDOWS_SCRGB,
+	WLR_IMAGE_DESCRIPTION_V1_WINDOWS_BT2100,
+};
+
 struct wlr_image_description_v1_data {
+	enum wlr_image_description_v1_kind kind;
 	uint32_t tf_named; // enum wp_color_manager_v1_transfer_function, zero if unset
 	uint32_t primaries_named; // enum wp_color_manager_v1_primaries, zero if unset
+
+	bool has_luminances;
+	struct wlr_color_luminances luminances;
 
 	bool has_mastering_display_primaries;
 	struct wlr_color_primaries mastering_display_primaries;
@@ -79,16 +89,45 @@ struct wlr_color_manager_v1 {
 		struct wl_list surface_feedbacks; // wlr_color_management_surface_feedback_v1.link
 
 		uint64_t last_image_desc_identity;
+		uint32_t windows_hdr_features;
 
 		struct wl_listener display_destroy;
 	} WLR_PRIVATE;
 };
 
+enum wlr_color_manager_v1_windows_hdr_feature {
+	WLR_COLOR_MANAGER_V1_WINDOWS_HDR_SCRGB = 1 << 0,
+	WLR_COLOR_MANAGER_V1_WINDOWS_HDR_BT2100 = 1 << 1,
+};
+
 struct wlr_color_manager_v1 *wlr_color_manager_v1_create(struct wl_display *display,
 	uint32_t version, const struct wlr_color_manager_v1_options *options);
 
+/**
+ * Enable predefined Windows HDR image descriptions. This must be called
+ * immediately after wlr_color_manager_v1_create(), before clients can bind the
+ * manager global.
+ */
+void wlr_color_manager_v1_set_windows_hdr_features(
+	struct wlr_color_manager_v1 *manager, uint32_t features);
+
 const struct wlr_image_description_v1_data *
 wlr_surface_get_image_description_v1_data(struct wlr_surface *surface);
+
+/** Return true when a surface uses a predefined Windows HDR description. */
+bool wlr_surface_has_windows_hdr_image_description(struct wlr_surface *surface);
+
+/** Return true when a surface uses the predefined Windows-scRGB description. */
+bool wlr_surface_has_windows_scrgb_image_description(struct wlr_surface *surface);
+
+/**
+ * Encode primary luminances for wp_image_description_info_v1.luminances.
+ * When reference_headroom_max_lum is non-zero, reference_lum is clamped after
+ * rounding so it remains strictly below that target-volume maximum.
+ */
+void wlr_color_manager_v1_encode_luminances(
+	const struct wlr_color_luminances *luminances, uint32_t reference_headroom_max_lum,
+	uint32_t *min_lum, uint32_t *max_lum, uint32_t *reference_lum);
 
 void wlr_color_manager_v1_set_surface_preferred_image_description(
 	struct wlr_color_manager_v1 *manager, struct wlr_surface *surface,

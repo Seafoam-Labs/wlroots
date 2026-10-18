@@ -1,15 +1,67 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <string.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_text_input_v3.h>
 #include <wlr/util/log.h>
 #include "text-input-unstable-v3-protocol.h"
 
+/* Private extension preserves the public layout consumed by zig-wlroots. */
+struct text_input {
+	struct wlr_text_input_v3 base;
+	uint32_t pending_actions, current_actions;
+	bool panel_visible;
+	bool has_preedit;
+	size_t preedit_len;
+};
+
+static struct text_input *private_text_input(struct wlr_text_input_v3 *base) {
+	struct text_input *input = wl_container_of(base, input, base);
+	return input;
+}
+
+uint32_t wlr_text_input_v3_get_available_actions(struct wlr_text_input_v3 *base) {
+	return private_text_input(base)->current_actions;
+}
+
+bool wlr_text_input_v3_get_panel_requested(struct wlr_text_input_v3 *base) {
+	return private_text_input(base)->panel_visible;
+}
+
+void wlr_text_input_v3_send_action(struct wlr_text_input_v3 *base,
+		uint32_t action, uint32_t serial) {
+	if (wl_resource_get_version(base->resource) >= 2 && base->current_enabled &&
+			base->focused_surface && action == ZWP_TEXT_INPUT_V3_ACTION_SUBMIT &&
+			(private_text_input(base)->current_actions & (1u << action))) {
+		zwp_text_input_v3_send_action(base->resource, action, serial);
+	}
+}
+
+void wlr_text_input_v3_send_language(struct wlr_text_input_v3 *base, const char *language) {
+	if (wl_resource_get_version(base->resource) >= 2) {
+		zwp_text_input_v3_send_language(base->resource, language);
+	}
+}
+
+void wlr_text_input_v3_send_preedit_hint(struct wlr_text_input_v3 *base,
+		uint32_t start, uint32_t end, uint32_t hint) {
+	struct text_input *input = private_text_input(base);
+	if (wl_resource_get_version(base->resource) >= 2 && input->has_preedit &&
+			start <= end && end <= input->preedit_len &&
+			hint >= ZWP_TEXT_INPUT_V3_PREEDIT_HINT_WHOLE &&
+			hint <= ZWP_TEXT_INPUT_V3_PREEDIT_HINT_COMPOSE_ERROR) {
+		zwp_text_input_v3_send_preedit_hint(base->resource, start, end, hint);
+	}
+}
+
 static void text_input_clear_focused_surface(struct wlr_text_input_v3 *text_input) {
 	wl_list_remove(&text_input->surface_destroy.link);
 	wl_list_init(&text_input->surface_destroy.link);
 	text_input->focused_surface = NULL;
+	struct text_input *input = private_text_input(text_input);
+	input->pending_actions = input->current_actions = 0;
+	input->panel_visible = input->has_preedit = false;
 }
 
 static const struct zwp_text_input_v3_interface text_input_impl;
@@ -26,6 +78,9 @@ void wlr_text_input_v3_send_enter(struct wlr_text_input_v3 *text_input,
 	assert(wl_resource_get_client(text_input->resource)
 		== wl_resource_get_client(surface->resource));
 	assert(text_input->focused_surface == NULL);
+	struct text_input *input = private_text_input(text_input);
+	input->pending_actions = input->current_actions = 0;
+	input->panel_visible = false;
 	text_input->focused_surface = surface;
 	wl_signal_add(&text_input->focused_surface->events.destroy,
 		&text_input->surface_destroy);
@@ -44,6 +99,13 @@ void wlr_text_input_v3_send_preedit_string(struct wlr_text_input_v3 *text_input,
 		const char *text, int32_t cursor_begin, int32_t cursor_end) {
 	zwp_text_input_v3_send_preedit_string(text_input->resource, text,
 		cursor_begin, cursor_end);
+	struct text_input *input = private_text_input(text_input);
+	input->has_preedit = text != NULL;
+	input->preedit_len = text ? strlen(text) : 0;
+	if (text_input->current.content_type.hint & ZWP_TEXT_INPUT_V3_CONTENT_HINT_PREEDIT_SHOWN) {
+		wlr_text_input_v3_send_preedit_hint(text_input, 0, input->preedit_len,
+			ZWP_TEXT_INPUT_V3_PREEDIT_HINT_WHOLE);
+	}
 }
 
 void wlr_text_input_v3_send_commit_string(struct wlr_text_input_v3 *text_input,
@@ -61,6 +123,7 @@ void wlr_text_input_v3_send_delete_surrounding_text(
 void wlr_text_input_v3_send_done(struct wlr_text_input_v3 *text_input) {
 	zwp_text_input_v3_send_done(text_input->resource,
 		text_input->current_serial);
+	private_text_input(text_input)->has_preedit = false;
 }
 
 static void wlr_text_input_destroy(struct wlr_text_input_v3 *text_input) {
@@ -100,6 +163,10 @@ static void text_input_enable(struct wl_client *client,
 		return;
 	}
 	struct wlr_text_input_v3_state defaults = {0};
+	struct text_input *input = private_text_input(text_input);
+	input->pending_actions = 0;
+	input->has_preedit = false;
+	input->panel_visible = false;
 	free(text_input->pending.surrounding.text);
 	text_input->pending = defaults;
 	text_input->pending_enabled = true;
@@ -112,6 +179,7 @@ static void text_input_disable(struct wl_client *client,
 		return;
 	}
 	text_input->pending_enabled = false;
+	private_text_input(text_input)->pending_actions = 0;
 }
 
 static void text_input_set_surrounding_text(struct wl_client *client,
@@ -185,6 +253,12 @@ static void text_input_commit(struct wl_client *client,
 	bool old_enabled = text_input->current_enabled;
 	text_input->current_enabled = text_input->pending_enabled;
 	text_input->current_serial++;
+	struct text_input *input = private_text_input(text_input);
+	input->current_actions = text_input->current_enabled ? input->pending_actions : 0;
+	if (!text_input->current_enabled) {
+		input->panel_visible = false;
+		input->has_preedit = false;
+	}
 
 	if (text_input->focused_surface == NULL) {
 		wlr_log(WLR_DEBUG, "Text input commit received without focus");
@@ -201,6 +275,47 @@ static void text_input_commit(struct wl_client *client,
 	}
 }
 
+static void text_input_set_available_actions(struct wl_client *client,
+		struct wl_resource *resource, struct wl_array *actions) {
+	struct wlr_text_input_v3 *base = text_input_from_resource(resource);
+	if (!base) {
+		return;
+	}
+	uint32_t mask = 0;
+	if (actions->size % sizeof(uint32_t) != 0) {
+		goto invalid;
+	}
+	uint32_t *action;
+	wl_array_for_each(action, actions) {
+		if (*action != ZWP_TEXT_INPUT_V3_ACTION_SUBMIT || (mask & (1u << *action))) {
+			goto invalid;
+		}
+		mask |= 1u << *action;
+	}
+	private_text_input(base)->pending_actions = mask;
+	return;
+invalid:
+	wl_resource_post_error(resource, ZWP_TEXT_INPUT_V3_ERROR_INVALID_ACTION,
+		"invalid or duplicate available action");
+}
+
+/* Panel visibility is a hint, not an enable/disable request. The compositor's
+ * existing input-method-v2 backend has no panel visibility request; remember
+ * the focused hint for providers which can consume it without changing focus. */
+static void text_input_show_panel(struct wl_client *client, struct wl_resource *resource) {
+	struct wlr_text_input_v3 *base = text_input_from_resource(resource);
+	if (base && base->current_enabled && base->focused_surface) {
+		private_text_input(base)->panel_visible = true;
+	}
+}
+
+static void text_input_hide_panel(struct wl_client *client, struct wl_resource *resource) {
+	struct wlr_text_input_v3 *base = text_input_from_resource(resource);
+	if (base && base->focused_surface) {
+		private_text_input(base)->panel_visible = false;
+	}
+}
+
 static const struct zwp_text_input_v3_interface text_input_impl = {
 	.destroy = text_input_destroy,
 	.enable = text_input_enable,
@@ -210,6 +325,9 @@ static const struct zwp_text_input_v3_interface text_input_impl = {
 	.set_content_type = text_input_set_content_type,
 	.set_cursor_rectangle = text_input_set_cursor_rectangle,
 	.commit = text_input_commit,
+	.set_available_actions = text_input_set_available_actions,
+	.show_input_panel = text_input_show_panel,
+	.hide_input_panel = text_input_hide_panel,
 };
 
 static const struct zwp_text_input_manager_v3_interface text_input_manager_impl;
@@ -259,7 +377,7 @@ static void text_input_manager_get_text_input(struct wl_client *client,
 		return;
 	}
 
-	struct wlr_text_input_v3 *text_input = calloc(1, sizeof(*text_input));
+	struct wlr_text_input_v3 *text_input = calloc(1, sizeof(struct text_input));
 	if (text_input == NULL) {
 		wl_client_post_no_memory(client);
 		return;
@@ -336,7 +454,7 @@ struct wlr_text_input_manager_v3 *wlr_text_input_manager_v3_create(
 	wl_signal_init(&manager->events.destroy);
 
 	manager->global = wl_global_create(display,
-		&zwp_text_input_manager_v3_interface, 1, manager,
+		&zwp_text_input_manager_v3_interface, 2, manager,
 		text_input_manager_bind);
 	if (!manager->global) {
 		free(manager);

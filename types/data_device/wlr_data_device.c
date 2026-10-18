@@ -35,6 +35,10 @@ static void data_device_set_selection(struct wl_client *client,
 		source = client_data_source_from_resource(source_resource);
 	}
 
+	if (source != NULL && !xdg_toplevel_drag_check_selection(source, device_resource)) {
+		return;
+	}
+
 	if (source != NULL) {
 		source->finalized = true;
 	}
@@ -62,6 +66,11 @@ static void data_device_start_drag(struct wl_client *client,
 		source = client_data_source_from_resource(source_resource);
 	}
 
+	if (source && source->toplevel_drag_used && source->finalized) {
+		wl_resource_post_error(device_resource, WL_DATA_DEVICE_ERROR_USED_SOURCE,
+			"toplevel drag source already used");
+		return;
+	}
 	struct wlr_surface *icon = NULL;
 	if (icon_resource) {
 		icon = wlr_surface_from_resource(icon_resource);

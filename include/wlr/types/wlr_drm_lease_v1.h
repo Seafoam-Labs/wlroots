@@ -9,6 +9,8 @@
 #ifndef WLR_TYPES_WLR_DRM_LEASE_V1_H
 #define WLR_TYPES_WLR_DRM_LEASE_V1_H
 
+#define WLR_AQUEOUS_DRM_LEASE_VERSION 1
+
 #include <wayland-server-core.h>
 
 struct wlr_backend;

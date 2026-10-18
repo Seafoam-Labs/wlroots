@@ -13,6 +13,7 @@
 #include "wlr-screencopy-unstable-v1-protocol.h"
 #include "render/pixel_format.h"
 #include "render/wlr_renderer.h"
+#include "types/capture_shm.h"
 
 #define SCREENCOPY_MANAGER_VERSION 3
 
@@ -212,12 +213,8 @@ static bool frame_shm_copy(struct wlr_screencopy_frame_v1 *frame,
 		goto out;
 	}
 
-	ok = wlr_texture_read_pixels(texture, &(struct wlr_texture_read_pixels_options) {
-		.data = data,
-		.format = format,
-		.stride = stride,
-		.src_box = frame->box,
-	});
+	ok = capture_shm_read(texture, data, format, stride, &frame->box,
+		true, output->image_description);
 
 	wlr_texture_destroy(texture);
 
@@ -540,7 +537,7 @@ static void capture_output(struct wl_client *wl_client,
 		goto error;
 	}
 
-	frame->shm_format = wlr_texture_preferred_read_format(texture);
+	frame->shm_format = screencopy_shm_format(wlr_texture_preferred_read_format(texture));
 	wlr_texture_destroy(texture);
 
 	if (frame->shm_format == DRM_FORMAT_INVALID) {

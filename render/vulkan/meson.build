@@ -39,6 +39,8 @@ glslang_version = glslang_version_info.split('\n')[0].split(':')[-1]
 wlr_files += files(
 	'pass.c',
 	'renderer.c',
+	'copy.c',
+	'copy_allocator.c',
 	'texture.c',
 	'vulkan.c',
 	'util.c',

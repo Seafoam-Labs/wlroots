@@ -8,6 +8,7 @@
 #include <wlr/types/wlr_output.h>
 #include <wlr/util/addon.h>
 #include "ext-image-capture-source-v1-protocol.h"
+#include "types/capture_output.h"
 
 #define OUTPUT_IMAGE_SOURCE_MANAGER_V1_VERSION 1
 
@@ -34,6 +35,8 @@ struct wlr_ext_output_image_capture_source_v1 {
 	struct output_cursor_source cursor;
 
 	size_t num_started;
+	bool color_damage;
+	bool constraints_valid;
 	bool software_cursors_locked;
 };
 
@@ -41,6 +44,7 @@ struct wlr_ext_output_image_capture_source_v1_frame_event {
 	struct wlr_ext_image_capture_source_v1_frame_event base;
 	struct wlr_buffer *buffer;
 	struct timespec when;
+	struct wlr_output_image_description description;
 };
 
 static void output_source_start(struct wlr_ext_image_capture_source_v1 *base,
@@ -85,8 +89,13 @@ static void output_source_copy_frame(struct wlr_ext_image_capture_source_v1 *bas
 	struct wlr_ext_output_image_capture_source_v1_frame_event *event =
 		wl_container_of(base_event, event, base);
 
-	if (wlr_ext_image_copy_capture_frame_v1_copy_buffer(frame,
-			event->buffer, source->output->renderer)) {
+	if (!source->constraints_valid) {
+		wlr_ext_image_copy_capture_frame_v1_fail(frame,
+			EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS);
+		return;
+	}
+	if (capture_copy_output(frame, event->buffer, source->output->renderer,
+			&event->description)) {
 		wlr_ext_image_copy_capture_frame_v1_ready(frame,
 			source->output->transform, &event->when);
 	}
@@ -109,6 +118,7 @@ static const struct wlr_ext_image_capture_source_v1_interface output_source_impl
 
 static void source_update_buffer_constraints(struct wlr_ext_output_image_capture_source_v1 *source) {
 	struct wlr_output *output = source->output;
+	source->constraints_valid = false;
 
 	if (!output->enabled) {
 		return;
@@ -118,8 +128,8 @@ static void source_update_buffer_constraints(struct wlr_ext_output_image_capture
 		return;
 	}
 
-	wlr_ext_image_capture_source_v1_set_constraints_from_swapchain(&source->base,
-		output->swapchain, output->renderer);
+	source->constraints_valid = capture_source_set_constraints(&source->base,
+		output->swapchain, output->renderer, capture_can_convert_sdr(output->image_description));
 }
 
 static void source_handle_output_commit(struct wl_listener *listener,
@@ -128,8 +138,14 @@ static void source_handle_output_commit(struct wl_listener *listener,
 	struct wlr_output_event_commit *event = data;
 
 	if (event->state->committed & (WLR_OUTPUT_STATE_MODE |
-			WLR_OUTPUT_STATE_RENDER_FORMAT | WLR_OUTPUT_STATE_ENABLED)) {
+			WLR_OUTPUT_STATE_RENDER_FORMAT | WLR_OUTPUT_STATE_ENABLED |
+			WLR_OUTPUT_STATE_IMAGE_DESCRIPTION)) {
 		source_update_buffer_constraints(source);
+	}
+
+	if (event->state->committed & WLR_OUTPUT_STATE_IMAGE_DESCRIPTION) {
+		source->color_damage = true;
+		wlr_output_update_needs_frame(source->output);
 	}
 
 	if (event->state->committed & WLR_OUTPUT_STATE_BUFFER) {
@@ -139,7 +155,7 @@ static void source_handle_output_commit(struct wl_listener *listener,
 		pixman_region32_init_rect(&full_damage, 0, 0, buffer->width, buffer->height);
 
 		const pixman_region32_t *damage;
-		if (event->state->committed & WLR_OUTPUT_STATE_DAMAGE) {
+		if (!source->color_damage && (event->state->committed & WLR_OUTPUT_STATE_DAMAGE)) {
 			damage = &event->state->damage;
 		} else {
 			damage = &full_damage;
@@ -152,6 +168,14 @@ static void source_handle_output_commit(struct wl_listener *listener,
 			.buffer = buffer,
 			.when = event->when, // TODO: predict next presentation time instead
 		};
+		// The buffer and description belong to this same output commit. All
+		// listeners copy synchronously; no borrowed output description escapes.
+		frame_event.description = source->output->image_description ?
+			*source->output->image_description : (struct wlr_output_image_description) {
+				.primaries = WLR_COLOR_NAMED_PRIMARIES_SRGB,
+				.transfer_function = WLR_COLOR_TRANSFER_FUNCTION_GAMMA22,
+			};
+		source->color_damage = false;
 		wl_signal_emit_mutable(&source->base.events.frame, &frame_event);
 
 		pixman_region32_fini(&full_damage);

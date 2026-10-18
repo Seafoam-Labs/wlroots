@@ -1,4 +1,5 @@
 wlr_files += files(
+	'screencopy_sdr.c',
 	'data_device/wlr_data_device.c',
 	'data_device/wlr_data_offer.c',
 	'data_device/wlr_data_source.c',
@@ -10,6 +11,7 @@ wlr_files += files(
 	'output/cursor.c',
 	'output/output.c',
 	'output/render.c',
+	'output/presentation.c',
 	'output/state.c',
 	'output/swapchain.c',
 	'scene/drag_icon.c',
@@ -42,6 +44,8 @@ wlr_files += files(
 	'wlr_color_representation_v1.c',
 	'wlr_compositor.c',
 	'wlr_content_type_v1.c',
+	'wlr_fifo_v1.c',
+	'wlr_commit_timing_v1.c',
 	'wlr_cursor.c',
 	'wlr_cursor_shape_v1.c',
 	'wlr_damage_ring.c',
@@ -51,6 +55,7 @@ wlr_files += files(
 	'wlr_ext_data_control_v1.c',
 	'wlr_ext_foreign_toplevel_list_v1.c',
 	'wlr_ext_image_copy_capture_v1.c',
+	'wlr_aqueous_capture_color_v1.c',
 	'wlr_ext_workspace_v1.c',
 	'wlr_fixes.c',
 	'wlr_foreign_toplevel_management_v1.c',
@@ -100,6 +105,7 @@ wlr_files += files(
 	'wlr_xdg_activation_v1.c',
 	'wlr_xdg_decoration_v1.c',
 	'wlr_xdg_dialog_v1.c',
+	'wlr_xdg_toplevel_drag_v1.c',
 	'wlr_xdg_foreign_v1.c',
 	'wlr_xdg_foreign_v2.c',
 	'wlr_xdg_foreign_registry.c',
@@ -108,6 +114,8 @@ wlr_files += files(
 	'wlr_xdg_toplevel_icon_v1.c',
 	'wlr_xdg_toplevel_tag_v1.c',
 )
+
+wlr_deps += dependency('threads')
 
 if features.get('drm-backend')
 	wlr_files += files(

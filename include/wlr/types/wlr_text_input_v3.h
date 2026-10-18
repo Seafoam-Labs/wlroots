@@ -100,4 +100,17 @@ void wlr_text_input_v3_send_delete_surrounding_text(
 	uint32_t after_length);
 void wlr_text_input_v3_send_done(struct wlr_text_input_v3 *text_input);
 
+/* Interface version 2. Actions are represented by (1u << protocol_action).
+ * Sending helpers suppress events which the client's bound version lacks.
+ * An action requires an enabled, focused input and a committed available action.
+ * Preedit hints must follow preedit_string and precede done. */
+uint32_t wlr_text_input_v3_get_available_actions(struct wlr_text_input_v3 *text_input);
+bool wlr_text_input_v3_get_panel_requested(struct wlr_text_input_v3 *text_input);
+void wlr_text_input_v3_send_action(struct wlr_text_input_v3 *text_input,
+	uint32_t action, uint32_t serial);
+void wlr_text_input_v3_send_language(struct wlr_text_input_v3 *text_input,
+	const char *language);
+void wlr_text_input_v3_send_preedit_hint(struct wlr_text_input_v3 *text_input,
+	uint32_t start, uint32_t end, uint32_t hint);
+
 #endif

@@ -750,6 +750,14 @@ bool wlr_seat_client_validate_event_serial(struct wlr_seat_client *client,
 	uint32_t serial);
 
 /**
+ * Check an exact recent wl_pointer.enter serial issued to this seat client.
+ * Enter serials are client-wide, not tied to the target surface or pointer
+ * resource. Only the most recent 64 distinct enters are retained.
+ */
+bool wlr_seat_client_validate_pointer_enter_serial(struct wlr_seat_client *client,
+	uint32_t serial);
+
+/**
  * Get a seat client from a seat resource. Returns NULL if inert.
  */
 struct wlr_seat_client *wlr_seat_client_from_resource(

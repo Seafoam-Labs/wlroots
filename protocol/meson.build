@@ -1,5 +1,5 @@
 wayland_protos = dependency('wayland-protocols',
-	version: '>=1.47',
+	version: '>=1.49',
 	fallback: 'wayland-protocols',
 	default_options: ['tests=false'],
 )
@@ -37,11 +37,14 @@ protocols = {
 	'ext-session-lock-v1': wl_protocol_dir / 'staging/ext-session-lock/ext-session-lock-v1.xml',
 	'ext-data-control-v1': wl_protocol_dir / 'staging/ext-data-control/ext-data-control-v1.xml',
 	'ext-workspace-v1': wl_protocol_dir / 'staging/ext-workspace/ext-workspace-v1.xml',
+	'commit-timing-v1': wl_protocol_dir / 'staging/commit-timing/commit-timing-v1.xml',
+	'fifo-v1': wl_protocol_dir / 'staging/fifo/fifo-v1.xml',
 	'fractional-scale-v1': wl_protocol_dir / 'staging/fractional-scale/fractional-scale-v1.xml',
 	'linux-drm-syncobj-v1': wl_protocol_dir / 'staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml',
 	'security-context-v1': wl_protocol_dir / 'staging/security-context/security-context-v1.xml',
 	'single-pixel-buffer-v1': wl_protocol_dir / 'staging/single-pixel-buffer/single-pixel-buffer-v1.xml',
 	'xdg-activation-v1': wl_protocol_dir / 'staging/xdg-activation/xdg-activation-v1.xml',
+	'xdg-toplevel-drag-v1': wl_protocol_dir / 'staging/xdg-toplevel-drag/xdg-toplevel-drag-v1.xml',
 	'xdg-dialog-v1': wl_protocol_dir / 'staging/xdg-dialog/xdg-dialog-v1.xml',
 	'xdg-system-bell-v1': wl_protocol_dir / 'staging/xdg-system-bell/xdg-system-bell-v1.xml',
 	'xdg-toplevel-icon-v1': wl_protocol_dir / 'staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml',
@@ -62,6 +65,8 @@ protocols = {
 	'xdg-foreign-unstable-v2': wl_protocol_dir / 'unstable/xdg-foreign/xdg-foreign-unstable-v2.xml',
 	'xdg-output-unstable-v1': wl_protocol_dir / 'unstable/xdg-output/xdg-output-unstable-v1.xml',
 	'ext-transient-seat-v1': wl_protocol_dir / 'staging/ext-transient-seat/ext-transient-seat-v1.xml',
+
+	'aqueous-capture-color-v1': 'aqueous-capture-color-v1.xml',
 
 	# Other protocols
 	'drm': 'drm.xml',

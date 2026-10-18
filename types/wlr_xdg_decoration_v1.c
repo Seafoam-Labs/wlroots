@@ -5,7 +5,55 @@
 #include <wlr/util/log.h>
 #include "xdg-decoration-unstable-v1-protocol.h"
 
-#define DECORATION_MANAGER_VERSION 1
+#define DECORATION_MANAGER_VERSION 2
+
+/* Keep public struct layouts compatible with zig-wlroots. The surface addon
+ * remembers a destroyed decoration only until the next client commit. */
+struct decoration {
+	struct wlr_xdg_toplevel_decoration_v1 base;
+	bool configured;
+};
+
+struct decoration_memory {
+	struct wlr_addon addon;
+	struct wl_listener toplevel_destroy;
+	uint32_t seq;
+	enum wlr_xdg_toplevel_decoration_v1_mode mode;
+	bool valid;
+};
+
+static void memory_destroy(struct wlr_addon *addon) {
+	struct decoration_memory *memory = wl_container_of(addon, memory, addon);
+	wlr_addon_finish(addon);
+	wl_list_remove(&memory->toplevel_destroy.link);
+	free(memory);
+}
+
+static void memory_toplevel_destroy(struct wl_listener *listener, void *data) {
+	struct decoration_memory *memory = wl_container_of(listener, memory, toplevel_destroy);
+	memory->valid = false;
+	wl_list_remove(&memory->toplevel_destroy.link);
+	wl_list_init(&memory->toplevel_destroy.link);
+}
+
+static const struct wlr_addon_interface memory_impl = {
+	.name = "xdg-decoration-mode", .destroy = memory_destroy,
+};
+
+static struct decoration_memory *get_memory(struct wlr_surface *surface) {
+	struct wlr_addon *addon = wlr_addon_find(&surface->addons, NULL, &memory_impl);
+	if (addon) {
+		struct decoration_memory *memory = wl_container_of(addon, memory, addon);
+		return memory;
+	}
+	struct decoration_memory *memory = calloc(1, sizeof(*memory));
+	if (memory) {
+		wlr_addon_init(&memory->addon, &surface->addons, NULL, &memory_impl);
+		wl_list_init(&memory->toplevel_destroy.link);
+		memory->toplevel_destroy.notify = memory_toplevel_destroy;
+	}
+	return memory;
+}
 
 static const struct zxdg_toplevel_decoration_v1_interface
 	toplevel_decoration_impl;
@@ -61,6 +109,12 @@ static void toplevel_decoration_handle_resource_destroy(
 		struct wl_resource *resource) {
 	struct wlr_xdg_toplevel_decoration_v1 *decoration =
 		toplevel_decoration_from_resource(resource);
+	struct wlr_surface *surface = decoration->toplevel->base->surface;
+	struct decoration_memory *memory = get_memory(surface);
+	assert(memory); // Allocated before the decoration resource was created.
+	memory->mode = decoration->current.mode;
+	memory->seq = surface->pending.seq;
+	memory->valid = true;
 	wl_signal_emit_mutable(&decoration->events.destroy, decoration);
 
 	assert(wl_list_empty(&decoration->events.destroy.listener_list));
@@ -96,12 +150,14 @@ static void toplevel_decoration_handle_surface_configure(
 		wl_container_of(listener, decoration, surface_configure);
 	struct wlr_xdg_surface_configure *surface_configure = data;
 
-	if (decoration->pending.mode == decoration->scheduled_mode) {
+	struct decoration *private = wl_container_of(decoration, private, base);
+	if (private->configured && decoration->pending.mode == decoration->scheduled_mode) {
 		return;
 	}
 
 	struct wlr_xdg_toplevel_decoration_v1_configure *configure = calloc(1, sizeof(*configure));
 	if (configure == NULL) {
+		wl_resource_post_no_memory(decoration->resource);
 		return;
 	}
 	configure->surface_configure = surface_configure;
@@ -110,6 +166,7 @@ static void toplevel_decoration_handle_surface_configure(
 
 	zxdg_toplevel_decoration_v1_send_configure(decoration->resource,
 		configure->mode);
+	private->configured = true;
 }
 
 static void toplevel_decoration_handle_surface_ack_configure(
@@ -172,7 +229,9 @@ static void decoration_manager_handle_get_toplevel_decoration(
 	struct wlr_xdg_toplevel *toplevel =
 		wlr_xdg_toplevel_from_resource(toplevel_resource);
 
-	if (wlr_surface_has_buffer(toplevel->base->surface)) {
+	uint32_t version = wl_resource_get_version(manager_resource);
+	struct wlr_surface *surface = toplevel->base->surface;
+	if (version < 2 && (wlr_surface_has_buffer(surface) || surface->pending.buffer != NULL)) {
 		wl_resource_post_error(manager_resource,
 			ZXDG_TOPLEVEL_DECORATION_V1_ERROR_UNCONFIGURED_BUFFER,
 			"xdg_toplevel_decoration must not have a buffer at creation");
@@ -189,11 +248,14 @@ static void decoration_manager_handle_get_toplevel_decoration(
 		}
 	}
 
-	struct wlr_xdg_toplevel_decoration_v1 *decoration = calloc(1, sizeof(*decoration));
-	if (decoration == NULL) {
+	struct decoration_memory *memory = get_memory(surface);
+	struct decoration *private = calloc(1, sizeof(*private));
+	if (private == NULL || memory == NULL) {
+		free(private);
 		wl_client_post_no_memory(client);
 		return;
 	}
+	struct wlr_xdg_toplevel_decoration_v1 *decoration = &private->base;
 	decoration->manager = manager;
 	decoration->toplevel = toplevel;
 
@@ -203,8 +265,22 @@ static void decoration_manager_handle_get_toplevel_decoration(
 		wl_client_post_no_memory(client);
 		return;
 	}
+	if (version >= 2 && (wlr_surface_has_buffer(surface) || surface->pending.buffer != NULL)) {
+		decoration->pending.mode = decoration->current.mode =
+			memory->valid && memory->seq == surface->pending.seq ? memory->mode :
+			WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+		struct wlr_surface_state *cached;
+		wl_list_for_each(cached, &surface->cached, cached_state_link) {
+			struct wlr_xdg_toplevel_decoration_v1_state *state =
+				wlr_surface_synced_get_state(&decoration->synced, cached);
+			state->mode = decoration->current.mode;
+		}
+	}
+	memory->valid = false;
+	if (wl_list_empty(&memory->toplevel_destroy.link)) {
+		wl_signal_add(&toplevel->events.destroy, &memory->toplevel_destroy);
+	}
 
-	uint32_t version = wl_resource_get_version(manager_resource);
 	decoration->resource = wl_resource_create(client,
 		&zxdg_toplevel_decoration_v1_interface, version, id);
 	if (decoration->resource == NULL) {

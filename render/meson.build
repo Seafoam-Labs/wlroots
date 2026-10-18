@@ -7,6 +7,7 @@ endif
 
 wlr_files += files(
 	'color.c',
+	'color_pipeline.c',
 	'dmabuf.c',
 	'drm_format_set.c',
 	'drm_syncobj_merger.c',

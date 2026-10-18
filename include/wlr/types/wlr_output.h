@@ -106,6 +106,22 @@ struct wlr_output_image_description {
 	} mastering_luminance;
 	double max_cll; // max content light level
 	double max_fall; // max frame-average light level
+
+	// Aqueous: desired luminance of SDR diffuse white in cd/m² when the
+	// output transfer function is ST 2084 PQ. Scene composition scales
+	// relative-luminance (SDR) content so that diffuse white lands here
+	// instead of at the fixed PQ reference white. Zero keeps the wlroots
+	// default. Not encoded in DRM metadata.
+	double sdr_white_level;
+};
+
+// Aqueous: HDR static metadata parsed from the connector EDID CTA-861
+// extension. Luminances are in cd/m²; a value of zero means the display
+// did not advertise it.
+struct wlr_output_edid_hdr_static_metadata {
+	double max_luminance; // desired content max luminance
+	double max_frame_avg_luminance; // desired content max frame-average luminance
+	double min_luminance; // desired content min luminance
 };
 
 /**
@@ -272,6 +288,10 @@ struct wlr_output {
 		struct wlr_color_transform *color_transform;
 		struct wlr_color_primaries default_primaries_value;
 	} WLR_PRIVATE;
+
+	// Aqueous: desired-content luminances from the EDID CTA-861 HDR static
+	// metadata block. Zeroed when the display does not advertise them.
+	struct wlr_output_edid_hdr_static_metadata edid_hdr_static_metadata;
 };
 
 struct wlr_output_event_damage {
@@ -304,6 +324,24 @@ enum wlr_output_present_flag {
 	// The presentation of this update was done zero-copy.
 	WLR_OUTPUT_PRESENT_ZERO_COPY = 0x8,
 };
+
+/** Client-specific logical output projection. */
+struct wlr_output_client_projection {
+	int32_t x, y;
+	int32_t width, height;
+	int32_t scale;
+};
+
+typedef bool (*wlr_output_client_projection_func_t)(
+	struct wlr_output *output, struct wl_client *client,
+	struct wlr_output_client_projection *projection, void *data);
+
+void wlr_output_set_client_projection_handler(
+	wlr_output_client_projection_func_t handler, void *data);
+
+bool wlr_output_get_client_projection(struct wlr_output *output,
+	struct wl_client *client,
+	struct wlr_output_client_projection *projection);
 
 struct wlr_output_event_present {
 	struct wlr_output *output;
@@ -446,6 +484,11 @@ void wlr_output_add_software_cursors_to_render_pass(struct wlr_output *output,
  */
 const struct wlr_drm_format_set *wlr_output_get_primary_formats(
 	struct wlr_output *output, uint32_t buffer_caps);
+
+// Aqueous: HDR static metadata parsed from the connector EDID. The returned
+// pointer stays valid for the lifetime of the output.
+const struct wlr_output_edid_hdr_static_metadata *
+wlr_output_get_edid_hdr_static_metadata(struct wlr_output *output);
 /**
  * Check whether direct scan-out is allowed on the output.
  *
@@ -667,5 +710,15 @@ bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
  */
 struct wlr_render_pass *wlr_output_begin_render_pass(struct wlr_output *output,
 	struct wlr_output_state *state, struct wlr_buffer_pass_options *render_options);
+
+/* Aqueous single-compositor color policy. No output ABI changes. Callbacks
+ * run only for real commits and before legacy gamma acquisition/application.
+ * Clear the policy before destroying its context. Test-only calls never revoke. */
+void wlr_aqueous_set_color_guard(
+    bool (*commit)(struct wlr_output *, const struct wlr_output_state *, void *),
+    bool (*gamma)(struct wlr_output *, void *),
+    void (*gamma_changed)(struct wlr_output *, void *), void *data);
+bool wlr_aqueous_gamma_allowed(struct wlr_output *output);
+void wlr_aqueous_gamma_changed(struct wlr_output *output);
 
 #endif

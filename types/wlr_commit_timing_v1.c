@@ -1,0 +1,580 @@
+/* Surface-owned deadlines and synchronized commit boundaries. */
+#include <assert.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <time.h>
+#include <wlr/types/wlr_compositor.h>
+#include <wlr/types/wlr_subcompositor.h>
+#include <wlr/types/wlr_commit_timing_v1.h>
+#include "types/wlr_commit_timing_v1.h"
+#include "types/wlr_fifo_v1.h"
+#include "types/wlr_surface_guard.h"
+#include "commit-timing-v1-protocol.h"
+
+/* Optional test-build counters; absent from production builds. Indices are
+ * documented in the wire fixture. Gauge counters are not reset between calls. */
+#ifdef WLR_COMMIT_TIMING_DIAGNOSTICS
+static uint64_t counters[16];
+uint64_t *wlr_commit_timing_v1_debug_counters(void);
+uint64_t *wlr_commit_timing_v1_debug_counters(void) { return counters; }
+#define COUNT(i) (++counters[i])
+#define GAUGE(i, value) (counters[i] = (value))
+#else
+#define COUNT(i) ((void)0)
+#define GAUGE(i, value) ((void)0)
+#endif
+
+struct wlr_commit_timing_manager_v1 {
+	struct wl_global *global;
+	struct wl_event_loop *loop;
+	struct wl_event_source *timer, *idle;
+	struct wl_listener destroy;
+	struct wl_list surfaces, work, spare;
+	size_t spare_count;
+	bool timer_armed, dispatching, again;
+	uint64_t timer_seconds;
+	uint32_t timer_nanoseconds;
+	bool stopping;
+};
+struct timing_surface;
+struct dependency {
+	struct wl_list link, incoming;
+	struct timing_surface *child, *parent;
+	struct wlr_commit_timing_manager_v1 *manager;
+	uint32_t first, last;
+};
+struct timing_state {
+	bool has_timestamp, snapshot;
+	uint64_t seconds;
+	uint32_t nanoseconds;
+	struct wl_list children;
+};
+struct timing_surface {
+	struct wlr_addon addon;
+	struct wlr_surface_synced synced;
+	struct timing_state pending, current;
+	struct wlr_commit_timing_manager_v1 *manager;
+	struct wl_resource *resource;
+	struct wl_list link, incoming, work;
+	bool queued;
+};
+static const struct wlr_addon_interface addon_impl;
+static void display_destroy(struct wl_listener *listener, void *data);
+static void schedule(struct wlr_commit_timing_manager_v1 *manager);
+static void activate(struct timing_surface *timing) {
+	if (!timing->queued) {
+		timing->queued = true;
+		wl_list_insert(timing->manager->work.prev, &timing->work);
+	}
+	schedule(timing->manager);
+}
+
+static struct wlr_commit_timing_manager_v1 *get_manager(struct wlr_surface *surface) {
+	struct wl_display *display = wl_client_get_display(wl_resource_get_client(surface->resource));
+	struct wl_listener *listener = wl_display_get_destroy_listener(display, display_destroy);
+	if (!listener) return NULL;
+	struct wlr_commit_timing_manager_v1 *manager = wl_container_of(listener, manager, destroy);
+	return manager;
+}
+static struct timing_surface *get_surface(struct wlr_surface *surface) {
+	struct wlr_addon *addon = wlr_addon_find(&surface->addons, NULL, &addon_impl);
+	if (!addon) return NULL;
+	struct timing_surface *timing = wl_container_of(addon, timing, addon);
+	return timing;
+}
+static struct dependency *dependency_alloc(struct wlr_commit_timing_manager_v1 *manager) {
+	struct dependency *dep;
+	if (!wl_list_empty(&manager->spare)) {
+		dep = wl_container_of(manager->spare.next, dep, link);
+		wl_list_remove(&dep->link);
+		manager->spare_count--;
+		COUNT(1);
+		GAUGE(5, manager->spare_count);
+		*dep = (struct dependency){0};
+	} else {
+#ifdef WLR_COMMIT_TIMING_DIAGNOSTICS
+		if (counters[15] && --counters[15] == 0) return NULL;
+#endif
+		COUNT(0);
+		dep = calloc(1, sizeof(*dep));
+	}
+	if (dep) {
+		dep->manager = manager;
+#ifdef WLR_COMMIT_TIMING_DIAGNOSTICS
+		if (++counters[3] > counters[4]) counters[4] = counters[3];
+#endif
+	}
+	return dep;
+}
+static void dependency_recycle(struct dependency *dep) {
+#ifdef WLR_COMMIT_TIMING_DIAGNOSTICS
+	assert(counters[3]); counters[3]--;
+#endif
+	struct wlr_commit_timing_manager_v1 *manager = dep->manager;
+	if (!manager->stopping && manager->spare_count < 256) {
+		*dep = (struct dependency){0};
+		wl_list_insert(&manager->spare, &dep->link);
+		manager->spare_count++;
+		GAUGE(5, manager->spare_count);
+	} else {
+		COUNT(2);
+		free(dep);
+	}
+}
+static void state_init(void *data) {
+	COUNT(13);
+	struct timing_state *state = data;
+	wl_list_init(&state->children);
+}
+/* Remove ownership before unlocking: applying child state can reenter us. */
+static void release_dependency(struct dependency *dep, bool unlock) {
+	struct timing_surface *child = dep->child;
+	uint32_t seq = dep->first;
+	wl_list_remove(&dep->link);
+	wl_list_remove(&dep->incoming);
+	dependency_recycle(dep);
+	if (child && unlock) {
+		wlr_surface_unlock_cached(child->synced.surface, seq);
+	}
+}
+/* Abandon a transaction without calling compositor code from teardown or a
+ * synchronization-mode request. Its children drain on the next manager idle. */
+static void defer_dependency(struct dependency *dep) {
+	struct timing_surface *child = dep->child;
+	uint32_t seq = dep->first;
+	release_dependency(dep, false);
+	if (!child) return;
+	bool found = false;
+	struct wlr_surface_state *cached;
+	wl_list_for_each(cached, &child->synced.surface->cached, cached_state_link) {
+		if (cached->seq != seq) continue;
+		assert(cached->cached_state_locks > 0);
+		cached->cached_state_locks--;
+		found = true;
+		break;
+	}
+	assert(found);
+	activate(child);
+}
+static void state_finish(void *data) {
+	struct timing_state *state = data;
+	while (!wl_list_empty(&state->children)) {
+		struct dependency *dep = wl_container_of(state->children.next, dep, link);
+		defer_dependency(dep);
+	}
+}
+static void state_move(void *dst_data, void *src_data) {
+	struct timing_state *dst = dst_data, *src = src_data;
+	assert(wl_list_empty(&dst->children));
+	dst->snapshot = src->snapshot;
+	src->snapshot = false;
+	dst->has_timestamp = src->has_timestamp;
+	dst->seconds = src->seconds;
+	dst->nanoseconds = src->nanoseconds;
+	wl_list_insert_list(&dst->children, &src->children);
+	wl_list_init(&src->children);
+	src->has_timestamp = false;
+}
+static const struct wlr_surface_synced_impl synced_impl = {
+	.state_size = sizeof(struct timing_state), .init_state = state_init,
+	.finish_state = state_finish, .move_state = state_move,
+};
+static struct timing_surface *ensure_surface(struct wlr_surface *surface,
+		struct wlr_commit_timing_manager_v1 *manager) {
+	struct timing_surface *timing = get_surface(surface);
+	if (timing) return timing;
+	COUNT(12);
+	timing = calloc(1, sizeof(*timing));
+	if (!timing) goto oom;
+	timing->manager = manager;
+	wl_list_init(&timing->incoming);
+	if (!wlr_surface_synced_init(&timing->synced, surface, &synced_impl,
+			&timing->pending, &timing->current)) {
+		free(timing);
+		goto oom;
+	}
+	wlr_addon_init(&timing->addon, &surface->addons, NULL, &addon_impl);
+	wl_list_insert(&manager->surfaces, &timing->link);
+	if (!wl_list_empty(&surface->cached)) activate(timing);
+	return timing;
+oom:
+	wl_resource_post_no_memory(surface->resource);
+	return NULL;
+}
+
+bool commit_timing_managed(struct wlr_surface *surface) {
+	struct timing_surface *timing = get_surface(surface);
+	return timing && timing->current.snapshot;
+}
+/* Snapshot the child lock owned by this parent commit. A subsequent child
+ * commit takes a fresh lock, which bounds draining when this one is released. */
+static bool capture_child(struct timing_surface *parent, struct wlr_subsurface *sub) {
+	if (!sub->has_cache) return true;
+	struct timing_surface *child = ensure_surface(sub->surface, parent->manager);
+	if (!child) return false;
+	if (!wl_list_empty(&child->incoming)) {
+		struct dependency *first = wl_container_of(child->incoming.next, first, incoming);
+		assert(first->parent == parent);
+	}
+	struct dependency *dep = dependency_alloc(parent->manager);
+	if (!dep) {
+		wl_resource_post_no_memory(parent->synced.surface->resource);
+		return false;
+	}
+	assert(!wl_list_empty(&sub->surface->cached));
+	struct wlr_surface_state *last = wl_container_of(sub->surface->cached.prev, last, cached_state_link);
+	dep->parent = parent;
+	dep->child = child;
+	dep->first = sub->cached_seq;
+	dep->last = last->seq;
+	wl_list_insert(parent->pending.children.prev, &dep->link);
+	wl_list_insert(&child->incoming, &dep->incoming);
+	sub->has_cache = false;
+	return true;
+}
+bool commit_timing_capture(struct wlr_surface *surface) {
+	/* Leaf commits have no child ownership to snapshot, even with a timer. */
+	if (wl_list_empty(&surface->pending.subsurfaces_below) &&
+			wl_list_empty(&surface->pending.subsurfaces_above)) return true;
+	struct timing_surface *timing = get_surface(surface);
+	struct wlr_commit_timing_manager_v1 *manager = get_manager(surface);
+	if (!manager) return true;
+	if (!timing) timing = ensure_surface(surface, manager);
+	if (!timing) return false;
+	COUNT(11);
+	timing->pending.snapshot = true;
+	struct wlr_subsurface *sub;
+	wl_list_for_each(sub, &surface->pending.subsurfaces_below, pending.link) {
+		if (!capture_child(timing, sub)) return false;
+	}
+	wl_list_for_each(sub, &surface->pending.subsurfaces_above, pending.link) {
+		if (!capture_child(timing, sub)) return false;
+	}
+	return true;
+}
+struct readiness { bool have_now; struct timespec now; };
+static bool timestamp_ready(const struct timing_state *state, struct readiness *check) {
+	if (!state->has_timestamp) return true;
+	if (!check->have_now) {
+		COUNT(6);
+		if (clock_gettime(CLOCK_MONOTONIC, &check->now) < 0) abort();
+		check->have_now = true;
+	}
+	const struct timespec *now = &check->now;
+	return !state->has_timestamp || state->seconds < (uint64_t)now->tv_sec ||
+		(state->seconds == (uint64_t)now->tv_sec && state->nanoseconds <= (uint32_t)now->tv_nsec);
+}
+static bool state_ready(struct timing_surface *timing, struct wlr_surface_state *state,
+		struct readiness *check) {
+	COUNT(7);
+	struct timing_state *next = wlr_surface_synced_get_state(&timing->synced, state);
+	if (!timestamp_ready(next, check)) return false;
+	struct dependency *dep;
+	wl_list_for_each(dep, &next->children, link) {
+		if (!dep->child) continue;
+		struct wlr_surface *child = dep->child->synced.surface;
+		bool found = false;
+		struct wlr_surface_state *cached;
+		wl_list_for_each(cached, &child->cached, cached_state_link) {
+			unsigned owned = cached->seq == dep->first ? 1 : 0;
+			if (cached->cached_state_locks > owned ||
+					!state_ready(dep->child, cached, check) ||
+					!fifo_v1_state_ready(child, cached)) return false;
+			if (cached->seq == dep->last) { found = true; break; }
+		}
+		assert(found);
+	}
+	return true;
+}
+bool commit_timing_ready(struct wlr_surface *surface, struct wlr_surface_state *state) {
+	struct timing_surface *timing = get_surface(surface);
+	if (!timing) return true;
+	struct readiness check = {0};
+	return state_ready(timing, state, &check);
+}
+/* The common flat transaction needs no durable snapshots. Limit this path to
+ * one native-owned cached state per leaf: every other topology/queue retains
+ * the general snapshot path. Preflight is read-only until all children pass. */
+bool commit_timing_prepare_immediate(struct wlr_surface *surface,
+		struct commit_timing_immediate *frame) {
+	if (surface->pending.cached_state_locks || !wl_list_empty(&surface->cached) ||
+			!fifo_v1_state_ready(surface, &surface->pending)) return false;
+	struct readiness check = {0};
+	struct timing_surface *timing = get_surface(surface);
+	if (timing && (!wl_list_empty(&timing->pending.children) ||
+			!timestamp_ready(&timing->pending, &check))) return false;
+	struct wlr_subsurface *subs[COMMIT_TIMING_IMMEDIATE_CAP];
+	unsigned count = 0;
+	struct wl_list *lists[] = { &surface->pending.subsurfaces_below, &surface->pending.subsurfaces_above };
+	for (size_t i = 0; i < 2; i++) {
+		struct wlr_subsurface *sub;
+		wl_list_for_each(sub, lists[i], pending.link) {
+			if (!sub->has_cache) continue;
+			struct wlr_surface *child = sub->surface;
+			if (count == COMMIT_TIMING_IMMEDIATE_CAP ||
+				!wl_list_empty(&child->pending.subsurfaces_below) ||
+				!wl_list_empty(&child->pending.subsurfaces_above) ||
+				(wl_list_empty(&child->cached) || child->cached.next != child->cached.prev)) return false;
+			struct wlr_surface_state *cached = wl_container_of(child->cached.next, cached, cached_state_link);
+			struct timing_surface *ct = get_surface(child);
+			if (cached->seq != sub->cached_seq || cached->cached_state_locks != 1 ||
+				(ct && !state_ready(ct, cached, &check)) || !fifo_v1_state_ready(child, cached)) return false;
+			subs[count++] = sub;
+		}
+	}
+	/* Transfer every lock before callbacks. A later child commit must acquire a
+	 * new lock, so releasing this frame cannot accidentally drain that commit.
+	 * Guards remove dead children without leaving pointers into freed addons. */
+	COUNT(10);
+	frame->count = count;
+	for (unsigned i = 0; i < count; i++) {
+		frame->children[i].surface = subs[i]->surface;
+		frame->children[i].seq = subs[i]->cached_seq;
+		frame->children[i].released = false;
+		surface_guard_init(&frame->children[i].guard, subs[i]->surface);
+		subs[i]->has_cache = false;
+	}
+	return true;
+}
+void commit_timing_finish_immediate(struct commit_timing_immediate *frame) {
+	for (unsigned i = 0; i < frame->count; i++) {
+		if (!frame->children[i].guard.alive || frame->children[i].released) continue;
+		frame->children[i].released = true;
+		wlr_surface_unlock_cached(frame->children[i].surface, frame->children[i].seq);
+	}
+	for (unsigned i = 0; i < frame->count; i++) {
+		if (frame->children[i].guard.alive) {
+			wlr_addon_finish(&frame->children[i].guard.addon);
+			frame->children[i].guard.alive = false;
+		}
+	}
+}
+void commit_timing_apply(struct wlr_surface *surface) {
+	struct timing_surface *timing = get_surface(surface);
+	if (!timing || wl_list_empty(&timing->current.children)) return;
+	struct surface_guard guard;
+	surface_guard_init(&guard, surface);
+	while (!wl_list_empty(&timing->current.children)) {
+		struct dependency *dep = wl_container_of(timing->current.children.next, dep, link);
+		release_dependency(dep, true);
+		if (!guard.alive) return;
+	}
+	wlr_addon_finish(&guard.addon);
+}
+void commit_timing_changed(struct wlr_surface *surface) {
+	struct timing_surface *timing = get_surface(surface);
+	if (!timing) return;
+	if (!wl_list_empty(&surface->cached)) {
+		activate(timing);
+	} else if (timing->queued) {
+		wl_list_remove(&timing->work);
+		timing->queued = false;
+	}
+	/* A subsurface has one parent. detach() removes all incoming snapshots
+	 * before its role/parent changes, so queued generations all notify the
+	 * same parent. Walking each generation here makes a burst quadratic. */
+	if (!wl_list_empty(&timing->incoming)) {
+		struct dependency *dep = wl_container_of(timing->incoming.next, dep, incoming);
+		if (!wl_list_empty(&dep->parent->synced.surface->cached)) { COUNT(14); activate(dep->parent); }
+	}
+	struct wlr_commit_timing_manager_v1 *manager = timing->manager;
+	if (!manager->dispatching && wl_list_empty(&manager->work)) {
+		if (manager->idle) { wl_event_source_remove(manager->idle); manager->idle = NULL; }
+		if (manager->timer_armed) {
+			wl_event_source_timer_update(manager->timer, 0);
+			manager->timer_armed = false;
+		}
+	}
+}
+void commit_timing_detach(struct wlr_surface *surface) {
+	struct timing_surface *timing = get_surface(surface);
+	if (!timing) return;
+	while (!wl_list_empty(&timing->incoming)) {
+		struct dependency *dep = wl_container_of(timing->incoming.next, dep, incoming);
+		defer_dependency(dep);
+	}
+	activate(timing);
+}
+
+static void rearm(struct wlr_commit_timing_manager_v1 *manager) {
+	struct readiness check = {0};
+	const struct timing_state *earliest = NULL;
+	struct timing_surface *timing;
+	wl_list_for_each(timing, &manager->work, work) {
+		struct wlr_surface_state *cached;
+		wl_list_for_each(cached, &timing->synced.surface->cached, cached_state_link) {
+			const struct timing_state *state = wlr_surface_synced_get_state(&timing->synced, cached);
+			if (timestamp_ready(state, &check)) continue;
+			if (!earliest || state->seconds < earliest->seconds ||
+				(state->seconds == earliest->seconds && state->nanoseconds < earliest->nanoseconds)) earliest = state;
+		}
+	}
+	if (!earliest) {
+		if (manager->timer_armed && wl_event_source_timer_update(manager->timer, 0) < 0) abort();
+		manager->timer_armed = false;
+		return;
+	}
+	if (manager->timer_armed && manager->timer_seconds == earliest->seconds &&
+			manager->timer_nanoseconds == earliest->nanoseconds) return;
+	uint64_t seconds = earliest->seconds - (uint64_t)check.now.tv_sec;
+	int ms = INT_MAX;
+	if (seconds < INT_MAX / 1000) {
+		int64_t ns = (int64_t)seconds * 1000000000 + earliest->nanoseconds - check.now.tv_nsec;
+		ms = (int)((ns + 999999) / 1000000);
+		if (ms < 1) ms = 1;
+	}
+	COUNT(9);
+	if (wl_event_source_timer_update(manager->timer, ms) < 0) abort();
+	manager->timer_armed = true;
+	manager->timer_seconds = earliest->seconds;
+	manager->timer_nanoseconds = earliest->nanoseconds;
+}
+static void dispatch(void *data) {
+	COUNT(8);
+	struct wlr_commit_timing_manager_v1 *manager = data;
+	manager->idle = NULL;
+	manager->dispatching = true;
+	manager->again = false;
+	struct wl_list processed;
+	wl_list_init(&processed);
+	/* Move before callbacks: destroying this or another surface removes its
+	 * work link from whichever list owns it. No saved next pointer can dangle. */
+	while (!wl_list_empty(&manager->work)) {
+		struct timing_surface *timing = wl_container_of(manager->work.next, timing, work);
+		wl_list_remove(&timing->work);
+		wl_list_insert(processed.prev, &timing->work);
+		struct surface_guard guard;
+		surface_guard_init(&guard, timing->synced.surface);
+		surface_flush_cached(timing->synced.surface);
+		if (!guard.alive) continue;
+		if (timing->queued && wl_list_empty(&timing->synced.surface->cached)) {
+			wl_list_remove(&timing->work);
+			timing->queued = false;
+		}
+		wlr_addon_finish(&guard.addon);
+	}
+	wl_list_insert_list(&manager->work, &processed);
+	manager->dispatching = false;
+	rearm(manager);
+	if (manager->again) schedule(manager);
+}
+static int timer_expired(void *data) {
+	struct wlr_commit_timing_manager_v1 *manager = data;
+	manager->timer_armed = false;
+	schedule(manager);
+	return 0;
+}
+static void schedule(struct wlr_commit_timing_manager_v1 *manager) {
+	if (manager->stopping) return;
+	if (manager->dispatching) { manager->again = true; return; }
+	if (manager->idle || wl_list_empty(&manager->work)) return;
+	manager->idle = wl_event_loop_add_idle(manager->loop, dispatch, manager);
+	if (!manager->idle) {
+		struct timing_surface *timing;
+		wl_list_for_each(timing, &manager->surfaces, link) wl_resource_post_no_memory(timing->synced.surface->resource);
+	}
+}
+static void destroy_addon(struct wlr_addon *addon) {
+	struct timing_surface *timing = wl_container_of(addon, timing, addon);
+	/* Incoming snapshots become empty without unlocking a dying surface. */
+	while (!wl_list_empty(&timing->incoming)) {
+		struct dependency *dep = wl_container_of(timing->incoming.next, dep, incoming);
+		release_dependency(dep, false);
+	}
+	if (timing->resource) wl_resource_set_user_data(timing->resource, NULL);
+	if (timing->queued) wl_list_remove(&timing->work);
+	wl_list_remove(&timing->link);
+	wlr_addon_finish(addon);
+	wlr_surface_synced_finish(&timing->synced);
+	schedule(timing->manager);
+	free(timing);
+}
+static const struct wlr_addon_interface addon_impl = {
+	.name = "wlr_commit_timing_v1", .destroy = destroy_addon,
+};
+static void destroy_resource(struct wl_resource *resource) {
+	struct timing_surface *timing = wl_resource_get_user_data(resource);
+	if (timing) timing->resource = NULL;
+}
+static void destroy(struct wl_client *client, struct wl_resource *resource) {
+	wl_resource_destroy(resource);
+}
+static void set_timestamp(struct wl_client *client, struct wl_resource *resource,
+		uint32_t hi, uint32_t lo, uint32_t nsec) {
+	struct timing_surface *timing = wl_resource_get_user_data(resource);
+	if (!timing) {
+		wl_resource_post_error(resource, WP_COMMIT_TIMER_V1_ERROR_SURFACE_DESTROYED, "Surface destroyed");
+	} else if (nsec >= 1000000000) {
+		wl_resource_post_error(resource, WP_COMMIT_TIMER_V1_ERROR_INVALID_TIMESTAMP, "Invalid nanoseconds");
+	} else if (timing->pending.has_timestamp) {
+		wl_resource_post_error(resource, WP_COMMIT_TIMER_V1_ERROR_TIMESTAMP_EXISTS, "Pending timestamp already exists");
+	} else {
+		timing->pending.has_timestamp = true;
+		timing->pending.seconds = ((uint64_t)hi << 32) | lo;
+		timing->pending.nanoseconds = nsec;
+	}
+}
+static const struct wp_commit_timer_v1_interface timer_impl = {
+	.set_timestamp = set_timestamp, .destroy = destroy,
+};
+static void get_timer(struct wl_client *client, struct wl_resource *resource,
+		uint32_t id, struct wl_resource *surface_resource) {
+	struct wlr_surface *surface = wlr_surface_from_resource(surface_resource);
+	struct timing_surface *timing = ensure_surface(surface, wl_resource_get_user_data(resource));
+	if (!timing) return;
+	if (timing->resource) {
+		wl_resource_post_error(resource, WP_COMMIT_TIMING_MANAGER_V1_ERROR_COMMIT_TIMER_EXISTS, "Timer already exists");
+		return;
+	}
+	timing->resource = wl_resource_create(client, &wp_commit_timer_v1_interface, 1, id);
+	if (!timing->resource) { wl_client_post_no_memory(client); return; }
+	wl_resource_set_implementation(timing->resource, &timer_impl, timing, destroy_resource);
+}
+static const struct wp_commit_timing_manager_v1_interface manager_impl = {
+	.destroy = destroy, .get_timer = get_timer,
+};
+static void bind_manager(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
+	struct wl_resource *resource = wl_resource_create(client, &wp_commit_timing_manager_v1_interface, version, id);
+	if (!resource) { wl_client_post_no_memory(client); return; }
+	wl_resource_set_implementation(resource, &manager_impl, data, NULL);
+}
+static void display_destroy(struct wl_listener *listener, void *data) {
+	struct wlr_commit_timing_manager_v1 *manager = wl_container_of(listener, manager, destroy);
+	manager->stopping = true;
+	if (manager->idle) wl_event_source_remove(manager->idle);
+	wl_event_source_remove(manager->timer);
+	while (!wl_list_empty(&manager->surfaces)) {
+		struct timing_surface *timing = wl_container_of(manager->surfaces.next, timing, link);
+		destroy_addon(&timing->addon);
+	}
+	while (!wl_list_empty(&manager->spare)) {
+		struct dependency *dep = wl_container_of(manager->spare.next, dep, link);
+		wl_list_remove(&dep->link);
+		COUNT(2);
+		free(dep);
+	}
+	GAUGE(5, 0);
+	wl_list_remove(&manager->destroy.link);
+	wl_global_destroy(manager->global);
+	free(manager);
+}
+struct wlr_commit_timing_manager_v1 *wlr_commit_timing_manager_v1_create(struct wl_display *display) {
+	assert(!wl_display_get_destroy_listener(display, display_destroy));
+	struct wlr_commit_timing_manager_v1 *manager = calloc(1, sizeof(*manager));
+	if (!manager) return NULL;
+	manager->loop = wl_display_get_event_loop(display);
+	wl_list_init(&manager->surfaces);
+	wl_list_init(&manager->work);
+	wl_list_init(&manager->spare);
+	manager->timer = wl_event_loop_add_timer(manager->loop, timer_expired, manager);
+	if (!manager->timer) { free(manager); return NULL; }
+	manager->global = wl_global_create(display, &wp_commit_timing_manager_v1_interface, 1, manager, bind_manager);
+	if (!manager->global) { wl_event_source_remove(manager->timer); free(manager); return NULL; }
+	manager->destroy.notify = display_destroy;
+	wl_display_add_destroy_listener(display, &manager->destroy);
+	return manager;
+}
+struct wl_global *wlr_commit_timing_manager_v1_get_global(struct wlr_commit_timing_manager_v1 *manager) {
+	return manager->global;
+}

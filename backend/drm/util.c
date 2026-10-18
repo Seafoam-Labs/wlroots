@@ -105,6 +105,18 @@ void parse_edid(struct wlr_drm_connector *conn, size_t len, const uint8_t *data)
 		output->supported_transfer_functions |= WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ;
 	}
 
+	// Aqueous: keep the desired-content luminances around so compositors can
+	// pick a mastering profile that matches the display.
+	if (hdr_static_metadata->type1) {
+		output->edid_hdr_static_metadata = (struct wlr_output_edid_hdr_static_metadata){
+			.max_luminance = hdr_static_metadata->desired_content_max_luminance,
+			.max_frame_avg_luminance = hdr_static_metadata->desired_content_max_frame_avg_luminance,
+			.min_luminance = hdr_static_metadata->desired_content_min_luminance,
+		};
+	} else {
+		output->edid_hdr_static_metadata = (struct wlr_output_edid_hdr_static_metadata){0};
+	}
+
 	di_info_destroy(info);
 }
 

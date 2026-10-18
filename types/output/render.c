@@ -1,4 +1,9 @@
 #include <assert.h>
+#include <wlr/config.h>
+#include <wlr/types/wlr_output_presentation.h>
+#if WLR_HAS_VULKAN_RENDERER
+#include <wlr/render/vulkan.h>
+#endif
 #include <drm_fourcc.h>
 #include <stdlib.h>
 #include <wlr/interfaces/wlr_output.h>
@@ -32,6 +37,7 @@ bool wlr_output_init_render(struct wlr_output *output,
 	wlr_swapchain_destroy(output->cursor_swapchain);
 	output->cursor_swapchain = NULL;
 
+	wlr_output_reset_presentation(output);
 	output->allocator = allocator;
 	output->renderer = renderer;
 
@@ -153,6 +159,11 @@ bool output_pick_format(struct wlr_output *output,
 
 	const struct wlr_drm_format_set *render_formats =
 		wlr_renderer_get_render_formats(renderer);
+#if WLR_HAS_VULKAN_RENDERER
+	if (wlr_output_uses_presentation_copy(output)) {
+		render_formats = wlr_vk_renderer_get_copy_formats(renderer);
+	}
+#endif
 	if (render_formats == NULL) {
 		wlr_log(WLR_ERROR, "Failed to get render formats");
 		return false;

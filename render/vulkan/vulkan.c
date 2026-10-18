@@ -12,10 +12,13 @@
 #include <xf86drm.h>
 #include <vulkan/vulkan.h>
 #include <wlr/util/log.h>
+#include <wlr/backend.h>
+#include <wlr/render/vulkan.h>
 #include <wlr/version.h>
 #include <wlr/config.h>
 #include "render/dmabuf.h"
 #include "render/vulkan.h"
+#include "util/env.h"
 
 #if defined(__linux__)
 #include <sys/sysmacros.h>
@@ -123,6 +126,7 @@ struct wlr_vk_instance *vulkan_instance_create(bool debug) {
 		wlr_log_errno(WLR_ERROR, "allocation failed");
 		return NULL;
 	}
+	ini->refs = 1;
 
 	size_t extensions_len = 0;
 	const char *extensions[1] = {0};
@@ -208,6 +212,10 @@ error:
 
 void vulkan_instance_destroy(struct wlr_vk_instance *ini) {
 	if (!ini) {
+		return;
+	}
+	assert(ini->refs > 0);
+	if (--ini->refs > 0) {
 		return;
 	}
 
@@ -370,17 +378,33 @@ VkPhysicalDevice vulkan_find_drm_phdev(struct wlr_vk_instance *ini, int drm_fd) 
 	return VK_NULL_HANDLE;
 }
 
-int vulkan_open_phdev_drm_fd(VkPhysicalDevice phdev) {
-	// vulkan_find_drm_phdev() already checks that VK_EXT_physical_device_drm
-	// is supported
-	VkPhysicalDeviceDrmPropertiesEXT drm_props = {
+static bool phdev_drm_props(VkPhysicalDevice phdev,
+		VkPhysicalDeviceDrmPropertiesEXT *drm_props) {
+	uint32_t count = 0;
+	if (vkEnumerateDeviceExtensionProperties(phdev, NULL, &count, NULL) != VK_SUCCESS) {
+		return false;
+	}
+	VkExtensionProperties extensions[count + 1];
+	if (vkEnumerateDeviceExtensionProperties(phdev, NULL, &count, extensions) != VK_SUCCESS ||
+			!check_extension(extensions, count, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME)) {
+		return false;
+	}
+	*drm_props = (VkPhysicalDeviceDrmPropertiesEXT){
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
 	};
 	VkPhysicalDeviceProperties2 props = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-		.pNext = &drm_props,
+		.pNext = drm_props,
 	};
 	vkGetPhysicalDeviceProperties2(phdev, &props);
+	return true;
+}
+
+int vulkan_open_phdev_drm_fd(VkPhysicalDevice phdev) {
+	VkPhysicalDeviceDrmPropertiesEXT drm_props;
+	if (!phdev_drm_props(phdev, &drm_props)) {
+		return -1;
+	}
 
 	dev_t devid;
 	if (drm_props.hasRender) {
@@ -467,11 +491,24 @@ struct wlr_vk_device *vulkan_device_create(struct wlr_vk_instance *ini,
 	// extensions before the device is created
 	const char *extensions[32] = {0};
 	size_t extensions_len = 0;
-	extensions[extensions_len++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
-	extensions[extensions_len++] = VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME; // or vulkan 1.2
-	extensions[extensions_len++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
-	extensions[extensions_len++] = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME;
-	extensions[extensions_len++] = VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
+	const char *dmabuf_extensions[] = {
+		VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+		VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+		VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+		VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+	};
+	dev->dmabuf = true;
+	for (size_t i = 0; i < sizeof(dmabuf_extensions) / sizeof(dmabuf_extensions[0]); i++) {
+		dev->dmabuf &= check_extension(avail_ext_props, avail_extc, dmabuf_extensions[i]);
+	}
+	if (dev->dmabuf) {
+		for (size_t i = 0; i < sizeof(dmabuf_extensions) / sizeof(dmabuf_extensions[0]); i++) {
+			extensions[extensions_len++] = dmabuf_extensions[i];
+		}
+	} else {
+		wlr_log(WLR_INFO, "Vulkan device lacks DMA-BUF interoperability; presentation requires CPU copy");
+	}
+	extensions[extensions_len++] = VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME;
 	extensions[extensions_len++] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME; // or vulkan 1.2
 	extensions[extensions_len++] = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME; // or vulkan 1.3
 
@@ -486,7 +523,9 @@ struct wlr_vk_device *vulkan_device_create(struct wlr_vk_instance *ini,
 	{
 		uint32_t qfam_count;
 		vkGetPhysicalDeviceQueueFamilyProperties(phdev, &qfam_count, NULL);
-		assert(qfam_count > 0);
+		if (qfam_count == 0) {
+			goto error;
+		}
 		VkQueueFamilyProperties queue_props[qfam_count];
 		vkGetPhysicalDeviceQueueFamilyProperties(phdev, &qfam_count,
 			queue_props);
@@ -499,7 +538,10 @@ struct wlr_vk_device *vulkan_device_create(struct wlr_vk_instance *ini,
 				break;
 			}
 		}
-		assert(graphics_found);
+		if (!graphics_found) {
+			wlr_log(WLR_ERROR, "Vulkan device has no graphics queue");
+			goto error;
+		}
 	}
 
 	bool exportable_semaphore = false, importable_semaphore = false;
@@ -624,8 +666,9 @@ struct wlr_vk_device *vulkan_device_create(struct wlr_vk_instance *ini,
 
 	vkGetDeviceQueue(dev->dev, dev->queue_family, 0, &dev->queue);
 
-	load_device_proc(dev, "vkGetMemoryFdPropertiesKHR",
-		&dev->api.vkGetMemoryFdPropertiesKHR);
+	if (dev->dmabuf) {
+		load_device_proc(dev, "vkGetMemoryFdPropertiesKHR", &dev->api.vkGetMemoryFdPropertiesKHR);
+	}
 	load_device_proc(dev, "vkWaitSemaphoresKHR", &dev->api.vkWaitSemaphoresKHR);
 	load_device_proc(dev, "vkGetSemaphoreCounterValueKHR",
 		&dev->api.vkGetSemaphoreCounterValueKHR);
@@ -665,7 +708,7 @@ void vulkan_device_destroy(struct wlr_vk_device *dev) {
 		vkDestroyDevice(dev->dev, NULL);
 	}
 
-	if (dev->drm_fd > 0) {
+	if (dev->drm_fd >= 0) {
 		close(dev->drm_fd);
 	}
 
@@ -679,4 +722,166 @@ void vulkan_device_destroy(struct wlr_vk_device *dev) {
 
 	free(dev->format_props);
 	free(dev);
+}
+
+struct wlr_vk_renderer_candidates {
+	struct wlr_vk_instance *instance;
+	VkPhysicalDevice *devices;
+	size_t len, next;
+};
+
+// Keep the backend's device first. For nested/headless backends preserve the
+// old libdrm preference, but an inaccessible node must not hide later devices.
+static dev_t preferred_render_device(struct wlr_backend *backend) {
+	struct stat st;
+	int fd = wlr_backend_get_drm_fd(backend);
+	if (fd >= 0 && fstat(fd, &st) == 0) {
+		return st.st_rdev;
+	}
+	int count = drmGetDevices2(0, NULL, 0);
+	if (count <= 0) {
+		return 0;
+	}
+	drmDevice **devices = calloc(count, sizeof(*devices));
+	if (!devices) {
+		return 0;
+	}
+	count = drmGetDevices2(0, devices, count);
+	dev_t preferred = 0;
+	for (int i = 0; i < count; i++) {
+		if (devices[i]->available_nodes & (1 << DRM_NODE_RENDER)) {
+			fd = open(devices[i]->nodes[DRM_NODE_RENDER], O_RDWR | O_CLOEXEC);
+			if (fd >= 0) {
+				if (fstat(fd, &st) == 0) {
+					preferred = st.st_rdev;
+				}
+				close(fd);
+				if (preferred) {
+					break;
+				}
+			}
+		}
+	}
+	if (count > 0) {
+		drmFreeDevices(devices, count);
+	}
+	free(devices);
+	return preferred;
+}
+
+struct wlr_vk_renderer_candidates *wlr_vk_renderer_candidates_create(
+		struct wlr_backend *backend, bool allow_software) {
+	VkPhysicalDevice *devices = NULL;
+	bool software_only = env_parse_bool("WLR_RENDERER_FORCE_SOFTWARE");
+	const char *explicit_path = getenv("WLR_RENDER_DRM_DEVICE");
+	dev_t preferred = 0;
+	if (explicit_path) {
+		struct stat st;
+		int fd = open(explicit_path, O_RDWR | O_CLOEXEC);
+		if (fd < 0) {
+			wlr_log_errno(WLR_ERROR, "Cannot open explicit render device %s", explicit_path);
+			return NULL;
+		}
+		bool valid = drmGetNodeTypeFromFd(fd) == DRM_NODE_RENDER && fstat(fd, &st) == 0;
+		close(fd);
+		if (!valid || software_only) {
+			wlr_log(WLR_ERROR, "Invalid or conflicting Vulkan device restriction");
+			return NULL;
+		}
+		preferred = st.st_rdev;
+	} else if (!software_only) {
+		preferred = preferred_render_device(backend);
+	}
+	struct wlr_vk_renderer_candidates *candidates = calloc(1, sizeof(*candidates));
+	if (!candidates) {
+		return NULL;
+	}
+	candidates->instance = vulkan_instance_create(true);
+	if (!candidates->instance) {
+		goto error;
+	}
+	uint32_t count = 0;
+	if (vkEnumeratePhysicalDevices(candidates->instance->instance, &count, NULL) != VK_SUCCESS || count == 0) {
+		goto error;
+	}
+	devices = calloc(count, sizeof(*devices));
+	if (!devices) {
+		goto error;
+	}
+	if (vkEnumeratePhysicalDevices(candidates->instance->instance, &count, devices) != VK_SUCCESS) {
+		goto error;
+	}
+	candidates->devices = calloc(count, sizeof(*candidates->devices));
+	if (!candidates->devices) {
+		goto error;
+	}
+	// Stable ordering keeps separate ICD implementations of a device as distinct
+	// candidates. A virtual GPU is hardware; only VK_PHYSICAL_DEVICE_TYPE_CPU is
+	// software. Loader device filtering (VK_DRIVER_FILES, etc.) still applies.
+	for (unsigned rank = 0; rank < 3; rank++) {
+		for (uint32_t i = 0; i < count; i++) {
+			VkPhysicalDeviceProperties props;
+			vkGetPhysicalDeviceProperties(devices[i], &props);
+			if (props.apiVersion < VK_API_VERSION_1_1) {
+				continue;
+			}
+			bool cpu = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+			VkPhysicalDeviceDrmPropertiesEXT drm;
+			bool matches = preferred && phdev_drm_props(devices[i], &drm) &&
+				((drm.hasRender && makedev(drm.renderMajor, drm.renderMinor) == preferred) ||
+				(drm.hasPrimary && makedev(drm.primaryMajor, drm.primaryMinor) == preferred));
+			if ((explicit_path && (!matches || cpu)) ||
+					(software_only && !cpu) || (cpu && !allow_software)) {
+				continue;
+			}
+			unsigned device_rank = cpu ? 2 : matches ? 0 : 1;
+			if (rank == device_rank) {
+				candidates->devices[candidates->len++] = devices[i];
+			}
+		}
+	}
+	free(devices);
+	return candidates;
+
+error:
+	free(devices);
+	wlr_vk_renderer_candidates_destroy(candidates);
+	return NULL;
+}
+
+struct wlr_renderer *wlr_vk_renderer_candidates_next(
+		struct wlr_vk_renderer_candidates *candidates) {
+	while (candidates->next < candidates->len) {
+		VkPhysicalDevice phdev = candidates->devices[candidates->next++];
+		VkPhysicalDeviceProperties props;
+		vkGetPhysicalDeviceProperties(phdev, &props);
+		wlr_log(WLR_INFO, "Trying Vulkan candidate %zu/%zu: %s (%s)",
+			candidates->next, candidates->len, props.deviceName,
+			props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? "software" : "hardware");
+		struct wlr_vk_device *dev = vulkan_device_create(candidates->instance, phdev);
+		if (!dev) {
+			continue;
+		}
+		dev->drm_fd = vulkan_open_phdev_drm_fd(phdev);
+		// The renderer takes its own instance reference, even on creation failure.
+		candidates->instance->refs++;
+		struct wlr_renderer *renderer = vulkan_renderer_create_for_device(dev);
+		if (!renderer) {
+			continue;
+		}
+		if (env_parse_bool("WLR_RENDER_NO_EXPLICIT_SYNC")) {
+			renderer->features.timeline = false;
+		}
+		return renderer;
+	}
+	wlr_log(WLR_ERROR, "No remaining usable Vulkan candidates");
+	return NULL;
+}
+
+void wlr_vk_renderer_candidates_destroy(struct wlr_vk_renderer_candidates *candidates) {
+	if (candidates) {
+		vulkan_instance_destroy(candidates->instance);
+		free(candidates->devices);
+		free(candidates);
+	}
 }

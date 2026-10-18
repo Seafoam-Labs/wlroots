@@ -7,6 +7,7 @@
 #include <wlr/util/box.h>
 #include <wlr/util/log.h>
 
+#include "backend/drm/color_pipeline.h"
 #include "backend/drm/drm.h"
 #include "backend/drm/fb.h"
 #include "backend/drm/iface.h"
@@ -121,24 +122,34 @@ static bool register_planes_for_crtc(struct wlr_drm_backend *drm,
 static void finish(struct wlr_drm_backend *drm) {
 	for (size_t i = 0; i < drm->num_crtcs; i++) {
 		struct wlr_drm_crtc *crtc = &drm->crtcs[i];
-
-		if (crtc->primary) {
+		if (crtc->primary && crtc->primary->liftoff_layer) {
 			liftoff_layer_destroy(crtc->primary->liftoff_layer);
+			crtc->primary->liftoff_layer = NULL;
 		}
-		if (crtc->cursor) {
+		if (crtc->cursor && crtc->cursor->liftoff_layer) {
 			liftoff_layer_destroy(crtc->cursor->liftoff_layer);
+			crtc->cursor->liftoff_layer = NULL;
 		}
-
-		liftoff_layer_destroy(crtc->liftoff_composition_layer);
-		liftoff_output_destroy(crtc->liftoff);
+		if (crtc->liftoff_composition_layer) {
+			liftoff_layer_destroy(crtc->liftoff_composition_layer);
+			crtc->liftoff_composition_layer = NULL;
+		}
+		if (crtc->liftoff) {
+			liftoff_output_destroy(crtc->liftoff);
+			crtc->liftoff = NULL;
+		}
 	}
-
 	for (size_t i = 0; i < drm->num_planes; i++) {
 		struct wlr_drm_plane *plane = &drm->planes[i];
-		liftoff_plane_destroy(plane->liftoff);
+		if (plane->liftoff) {
+			liftoff_plane_destroy(plane->liftoff);
+			plane->liftoff = NULL;
+		}
 	}
-
-	liftoff_device_destroy(drm->liftoff);
+	if (drm->liftoff) {
+		liftoff_device_destroy(drm->liftoff);
+		drm->liftoff = NULL;
+	}
 }
 
 static bool add_prop(drmModeAtomicReq *req, uint32_t obj,
@@ -171,8 +182,19 @@ static bool set_plane_props(struct wlr_drm_plane *plane,
 		liftoff_layer_set_property(layer, "FB_ID", fb->id) == 0;
 }
 
+static bool set_layer_in_fence(struct liftoff_layer *layer, int fd) {
+	if (fd < 0) {
+		// libliftoff retains properties across tests and commits. The previous
+		// fence has been closed; omitting an update would reuse that descriptor.
+		liftoff_layer_unset_property(layer, "IN_FENCE_FD");
+		return true;
+	}
+	return liftoff_layer_set_property(layer, "IN_FENCE_FD", fd) == 0;
+}
+
 static bool disable_plane(struct wlr_drm_plane *plane) {
-	return liftoff_layer_set_property(plane->liftoff_layer, "FB_ID", 0) == 0;
+	return set_layer_in_fence(plane->liftoff_layer, -1) &&
+		liftoff_layer_set_property(plane->liftoff_layer, "FB_ID", 0) == 0;
 }
 
 static uint64_t to_fp16(double v) {
@@ -242,6 +264,7 @@ static bool set_layer_props(struct wlr_drm_backend *drm,
 		liftoff_layer_set_property(layer->liftoff, "SRC_Y", src_y) == 0 &&
 		liftoff_layer_set_property(layer->liftoff, "SRC_W", src_w) == 0 &&
 		liftoff_layer_set_property(layer->liftoff, "SRC_H", src_h) == 0 &&
+		set_layer_in_fence(layer->liftoff, layer->pending_in_fence_fd) &&
 		liftoff_layer_set_property(layer->liftoff, "FB_DAMAGE_CLIPS", fb_damage_clips) == 0;
 }
 
@@ -320,7 +343,17 @@ static bool add_connector(drmModeAtomicReq *req,
 		ok = ok && add_prop(req, conn->id, conn->props.content_type,
 			DRM_MODE_CONTENT_TYPE_GRAPHICS);
 	}
-	// TODO: set "max bpc"
+	if (modeset && active && conn->props.max_bpc != 0 && conn->max_bpc_bounds[1] != 0) {
+		ok = ok && add_prop(req, conn->id, conn->props.max_bpc,
+			drm_atomic_pick_max_bpc(conn, state->primary_fb));
+	}
+	if (conn->props.colorspace != 0) {
+		ok = ok && add_prop(req, conn->id, conn->props.colorspace, state->colorspace);
+	}
+	if (conn->props.hdr_output_metadata != 0) {
+		ok = ok && add_prop(req, conn->id, conn->props.hdr_output_metadata,
+			state->hdr_output_metadata);
+	}
 	ok = ok &&
 		add_prop(req, crtc->id, crtc->props.mode_id, state->mode_id) &&
 		add_prop(req, crtc->id, crtc->props.active, active);
@@ -346,12 +379,10 @@ static bool add_connector(drmModeAtomicReq *req,
 		liftoff_layer_set_property(crtc->liftoff_composition_layer,
 			"FB_DAMAGE_CLIPS", state->fb_damage_clips);
 
-		if (state->primary_in_fence_fd >= 0) {
-			liftoff_layer_set_property(crtc->primary->liftoff_layer,
-				"IN_FENCE_FD", state->primary_in_fence_fd);
-			liftoff_layer_set_property(crtc->liftoff_composition_layer,
-				"IN_FENCE_FD", state->primary_in_fence_fd);
-		}
+		ok = ok && set_layer_in_fence(crtc->primary->liftoff_layer,
+			state->primary_in_fence_fd);
+		ok = ok && set_layer_in_fence(crtc->liftoff_composition_layer,
+			state->primary_in_fence_fd);
 
 		if (state->base->committed & WLR_OUTPUT_STATE_LAYERS) {
 			for (size_t i = 0; i < state->base->layers_len; i++) {
@@ -390,13 +421,15 @@ static bool add_connector(drmModeAtomicReq *req,
 	return ok;
 }
 
-static void connector_update_layers_feedback(const struct wlr_drm_connector_state *state) {
+static bool connector_update_layers_acceptance(
+		const struct wlr_drm_connector_state *state) {
 	struct wlr_drm_backend *drm = state->connector->backend;
 
 	if (!(state->base->committed & WLR_OUTPUT_STATE_LAYERS)) {
-		return;
+		return true;
 	}
 
+	bool required_layers_accepted = true;
 	for (size_t i = 0; i < state->base->layers_len; i++) {
 		struct wlr_output_layer_state *layer_state = &state->base->layers[i];
 		struct wlr_drm_layer *layer = get_drm_layer(drm, layer_state->layer);
@@ -404,8 +437,81 @@ static void connector_update_layers_feedback(const struct wlr_drm_connector_stat
 			!liftoff_layer_needs_composition(layer->liftoff);
 		if (!layer_state->accepted) {
 			update_layer_feedback(drm, layer);
+			if (layer_state->must_scan_out) {
+				required_layers_accepted = false;
+			}
 		}
 	}
+	return required_layers_accepted;
+}
+
+static struct wlr_drm_plane *assigned_plane(
+	struct wlr_drm_backend *drm, struct liftoff_layer *layer) {
+	struct liftoff_plane *plane = liftoff_layer_get_plane(layer);
+	if (!plane) {
+		return NULL;
+	}
+	uint32_t id = liftoff_plane_get_id(plane);
+	for (size_t i = 0; i < drm->num_planes; i++) {
+		if (drm->planes[i].id == id) {
+			return &drm->planes[i];
+		}
+	}
+	return NULL;
+}
+
+static bool add_color_pipelines(struct wlr_drm_connector_state *s, drmModeAtomicReq *req) {
+	struct wlr_drm_backend *drm = s->connector->backend;
+	struct wlr_drm_crtc *crtc = s->connector->crtc;
+	if (!s->active) {
+		return true;
+	}
+	struct liftoff_layer *primary = crtc->primary->liftoff_layer;
+	if (liftoff_layer_needs_composition(primary)) {
+		primary = crtc->liftoff_composition_layer;
+	}
+	if (!drm_color_pipeline_add(
+			s, req, assigned_plane(drm, primary), s->primary_fb ? s->primary_fb->wlr_buf : NULL)) {
+		return false;
+	}
+	if (crtc->cursor &&
+		!drm_color_pipeline_add(s, req, assigned_plane(drm, crtc->cursor->liftoff_layer), NULL)) {
+		return false;
+	}
+	struct wlr_drm_layer *layer;
+	wl_list_for_each(layer, &crtc->layers, link) {
+		struct wlr_drm_plane *plane = assigned_plane(drm, layer->liftoff);
+		struct wlr_drm_fb *fb = layer->pending_fb;
+		if (!(s->base->committed & WLR_OUTPUT_STATE_LAYERS)) {
+			fb = layer->queued_fb ? layer->queued_fb : layer->current_fb;
+		}
+		if (plane && !drm_color_pipeline_add(s, req, plane, fb ? fb->wlr_buf : NULL)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool reset_device_color_pipelines(
+	const struct wlr_drm_device_state *state, drmModeAtomicReq *req) {
+	// A later connector may have previously owned a plane assigned to an
+	// earlier connector. Clear all previous assignments before setting any.
+	for (size_t i = 0; i < state->connectors_len; i++) {
+		if (!drm_color_pipeline_reset(&state->connectors[i], req)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool add_device_color_pipelines(
+	const struct wlr_drm_device_state *state, drmModeAtomicReq *req) {
+	for (size_t i = 0; i < state->connectors_len; i++) {
+		if (!add_color_pipelines(&state->connectors[i], req)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 static bool commit(struct wlr_drm_backend *drm,
@@ -448,6 +554,11 @@ static bool commit(struct wlr_drm_backend *drm,
 		}
 	}
 
+	// Allocation probes must not inherit a color pipeline belonging to the
+	// old framebuffer/assignment. The final test below uses the new recipes.
+	if (!reset_device_color_pipelines(state, req)) {
+		goto out;
+	}
 	for (size_t i = 0; i < state->connectors_len; i++) {
 		struct wlr_drm_connector *conn = state->connectors[i].connector;
 		struct wlr_drm_crtc *crtc = conn->crtc;
@@ -463,6 +574,10 @@ static bool commit(struct wlr_drm_backend *drm,
 			goto out;
 		}
 
+		if (!connector_update_layers_acceptance(&state->connectors[i])) {
+			goto out;
+		}
+
 		if (crtc->cursor &&
 				liftoff_layer_needs_composition(crtc->cursor->liftoff_layer)) {
 			wlr_drm_conn_log(conn, WLR_DEBUG, "Failed to scan-out cursor plane");
@@ -470,6 +585,16 @@ static bool commit(struct wlr_drm_backend *drm,
 		}
 	}
 
+	if (!add_device_color_pipelines(state, req)) {
+		goto out;
+	}
+	if (drm->color_pipeline_enabled && !test_only &&
+		drmModeAtomicCommit(drm->fd, req,
+			(flags & ~(DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK)) |
+				DRM_MODE_ATOMIC_TEST_ONLY,
+			NULL) != 0) {
+		goto out;
+	}
 	ok = drmModeAtomicCommit(drm->fd, req, flags, page_flip) == 0;
 	if (!ok) {
 		wlr_log_errno(test_only ? WLR_DEBUG : WLR_ERROR,
@@ -482,7 +607,6 @@ out:
 		struct wlr_drm_connector_state *conn_state = &state->connectors[i];
 		if (ok && !test_only) {
 			drm_atomic_connector_apply_commit(conn_state);
-			connector_update_layers_feedback(conn_state);
 		} else {
 			drm_atomic_connector_rollback_commit(conn_state);
 		}

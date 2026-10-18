@@ -8,6 +8,8 @@
 #include <wlr/render/wlr_renderer.h>
 #include "ext-image-copy-capture-v1-protocol.h"
 #include "render/pixel_format.h"
+#include "types/capture_output.h"
+#include "types/capture_shm.h"
 
 #define IMAGE_COPY_CAPTURE_MANAGER_V1_VERSION 1
 
@@ -41,7 +43,7 @@ static struct wlr_ext_image_copy_capture_manager_v1 *manager_from_resource(
 	return wl_resource_get_user_data(resource);
 }
 
-static struct wlr_ext_image_copy_capture_frame_v1 *frame_from_resource(
+struct wlr_ext_image_copy_capture_frame_v1 *wlr_ext_image_copy_capture_frame_v1_from_resource(
 		struct wl_resource *resource) {
 	assert(wl_resource_instance_of(resource,
 		&ext_image_copy_capture_frame_v1_interface, &frame_impl));
@@ -101,6 +103,7 @@ void wlr_ext_image_copy_capture_frame_v1_ready(struct wlr_ext_image_copy_capture
 	ext_image_copy_capture_frame_v1_send_transform(frame->resource, transform);
 	ext_image_copy_capture_frame_v1_send_presentation_time(frame->resource,
 		pres_time_sec >> 32, (uint32_t)pres_time_sec, presentation_time->tv_nsec);
+	capture_color_send(frame, NULL); // Unknown source unless copy supplied metadata.
 	ext_image_copy_capture_frame_v1_send_ready(frame->resource);
 	frame_destroy(frame);
 }
@@ -133,27 +136,28 @@ out:
 }
 
 static bool copy_shm(void *data, uint32_t format, size_t stride,
-		struct wlr_buffer *src, struct wlr_renderer *renderer) {
+		struct wlr_buffer *src, struct wlr_renderer *renderer,
+		const struct wlr_output_image_description *description, bool *converted) {
 	// TODO: bypass renderer if source buffer supports data ptr access
 	struct wlr_texture *texture = wlr_texture_from_buffer(renderer, src);
 	if (!texture) {
 		return false;
 	}
 
-	// TODO: only copy damaged region
-	bool ok = wlr_texture_read_pixels(texture, &(struct wlr_texture_read_pixels_options){
-		.data = data,
-		.format = format,
-		.stride = stride,
-	});
+	*converted = description && capture_can_convert_sdr(description) &&
+		screencopy_is_10bit(wlr_texture_preferred_read_format(texture)) && format == DRM_FORMAT_XRGB8888;
+	struct wlr_box box = {.width = src->width, .height = src->height};
+	bool ok = capture_shm_read(texture, data, format, stride, &box,
+		description && capture_can_convert_sdr(description), description);
 
 	wlr_texture_destroy(texture);
 
 	return ok;
 }
 
-bool wlr_ext_image_copy_capture_frame_v1_copy_buffer(struct wlr_ext_image_copy_capture_frame_v1 *frame,
-		struct wlr_buffer *src, struct wlr_renderer *renderer) {
+static bool capture_copy(struct wlr_ext_image_copy_capture_frame_v1 *frame,
+		struct wlr_buffer *src, struct wlr_renderer *renderer,
+		const struct wlr_output_image_description *description, bool scene_sdr) {
 	struct wlr_buffer *dst = frame->buffer;
 
 	if (src->width != dst->width || src->height != dst->height) {
@@ -163,6 +167,8 @@ bool wlr_ext_image_copy_capture_frame_v1_copy_buffer(struct wlr_ext_image_copy_c
 	}
 
 	bool ok = false;
+	bool converted = false;
+	bool shm = false;
 	enum ext_image_copy_capture_frame_v1_failure_reason failure_reason =
 		EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN;
 	struct wlr_dmabuf_attributes dmabuf;
@@ -170,7 +176,8 @@ bool wlr_ext_image_copy_capture_frame_v1_copy_buffer(struct wlr_ext_image_copy_c
 	uint32_t format;
 	size_t stride;
 	if (wlr_buffer_get_dmabuf(dst, &dmabuf)) {
-		if (frame->session->source->dmabuf_formats.len == 0) {
+		if (!wlr_drm_format_set_has(&frame->session->source->dmabuf_formats,
+				dmabuf.format, dmabuf.modifier)) {
 			ok = false;
 			failure_reason = EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS;
 		} else {
@@ -178,11 +185,22 @@ bool wlr_ext_image_copy_capture_frame_v1_copy_buffer(struct wlr_ext_image_copy_c
 		}
 	} else if (wlr_buffer_begin_data_ptr_access(dst,
 			WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
-		if (frame->session->source->shm_formats_len == 0) {
+		shm = true;
+		bool supported = false;
+		for (size_t i = 0; i < frame->session->source->shm_formats_len; i++) {
+			if (frame->session->source->shm_formats[i] == format) {
+				supported = true;
+				break;
+			}
+		}
+		const struct wlr_pixel_format_info *info = drm_get_pixel_format_info(format);
+		if (!supported || !info || stride > INT32_MAX ||
+				!pixel_format_info_check_stride(info, (int32_t)stride, dst->width) ||
+				dst->height <= 0 || stride > SIZE_MAX / (size_t)dst->height) {
 			ok = false;
 			failure_reason = EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS;
 		} else {
-			ok = copy_shm(data, format, stride, src, renderer);
+			ok = copy_shm(data, format, stride, src, renderer, description, &converted);
 		}
 		wlr_buffer_end_data_ptr_access(dst);
 	}
@@ -191,7 +209,36 @@ bool wlr_ext_image_copy_capture_frame_v1_copy_buffer(struct wlr_ext_image_copy_c
 		return false;
 	}
 
+	const struct wlr_output_image_description sdr = {
+		.primaries = WLR_COLOR_NAMED_PRIMARIES_SRGB,
+		.transfer_function = WLR_COLOR_TRANSFER_FUNCTION_GAMMA22,
+	};
+	// DMA-BUF uses a rendering path whose HDR color preservation is not yet
+	// guaranteed. Never label those bytes as native PQ without qualification.
+	capture_color_send(frame, (shm || scene_sdr) ? (converted ? &sdr : description) : NULL);
 	return true;
+}
+
+bool capture_copy_output(struct wlr_ext_image_copy_capture_frame_v1 *frame,
+		struct wlr_buffer *src, struct wlr_renderer *renderer,
+		const struct wlr_output_image_description *description) {
+	return capture_copy(frame, src, renderer, description, false);
+}
+
+bool capture_copy_scene(struct wlr_ext_image_copy_capture_frame_v1 *frame,
+		struct wlr_buffer *src, struct wlr_renderer *renderer, bool known_sdr) {
+	// The scene render pass already converted the input into this encoding.
+	// The subsequent default SDR blit keeps that encoding for DMA-BUF too.
+	const struct wlr_output_image_description sdr = {
+		.primaries = WLR_COLOR_NAMED_PRIMARIES_SRGB,
+		.transfer_function = WLR_COLOR_TRANSFER_FUNCTION_GAMMA22,
+	};
+	return capture_copy(frame, src, renderer, known_sdr ? &sdr : NULL, known_sdr);
+}
+
+bool wlr_ext_image_copy_capture_frame_v1_copy_buffer(struct wlr_ext_image_copy_capture_frame_v1 *frame,
+		struct wlr_buffer *src, struct wlr_renderer *renderer) {
+	return capture_copy_output(frame, src, renderer, NULL);
 }
 
 void wlr_ext_image_copy_capture_frame_v1_fail(struct wlr_ext_image_copy_capture_frame_v1 *frame,
@@ -207,7 +254,7 @@ static void frame_handle_destroy(struct wl_client *client,
 
 static void frame_handle_attach_buffer(struct wl_client *client,
 		struct wl_resource *frame_resource, struct wl_resource *buffer_resource) {
-	struct wlr_ext_image_copy_capture_frame_v1 *frame = frame_from_resource(frame_resource);
+	struct wlr_ext_image_copy_capture_frame_v1 *frame = wlr_ext_image_copy_capture_frame_v1_from_resource(frame_resource);
 	if (frame == NULL) {
 		return;
 	}
@@ -232,7 +279,7 @@ static void frame_handle_attach_buffer(struct wl_client *client,
 static void frame_handle_damage_buffer(struct wl_client *client,
 		struct wl_resource *frame_resource, int32_t x, int32_t y,
 		int32_t width, int32_t height) {
-	struct wlr_ext_image_copy_capture_frame_v1 *frame = frame_from_resource(frame_resource);
+	struct wlr_ext_image_copy_capture_frame_v1 *frame = wlr_ext_image_copy_capture_frame_v1_from_resource(frame_resource);
 	if (frame == NULL) {
 		return;
 	}
@@ -257,7 +304,7 @@ static void frame_handle_damage_buffer(struct wl_client *client,
 
 static void frame_handle_capture(struct wl_client *client,
 		struct wl_resource *frame_resource) {
-	struct wlr_ext_image_copy_capture_frame_v1 *frame = frame_from_resource(frame_resource);
+	struct wlr_ext_image_copy_capture_frame_v1 *frame = wlr_ext_image_copy_capture_frame_v1_from_resource(frame_resource);
 	if (frame == NULL) {
 		return;
 	}
@@ -415,6 +462,10 @@ static void session_handle_source_constraints_update(struct wl_listener *listene
 		void *data) {
 	struct wlr_ext_image_copy_capture_session_v1 *session =
 		wl_container_of(listener, session, source_constraints_update);
+	// Resizing or changing color/format invalidates reused destination content.
+	pixman_region32_clear(&session->damage);
+	pixman_region32_union_rect(&session->damage, &session->damage, 0, 0,
+		session->source->width, session->source->height);
 	session_send_constraints(session);
 }
 

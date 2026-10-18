@@ -11,6 +11,14 @@
 #define OUTPUT_DONE_DEPRECATED_SINCE_VERSION 3
 #define OUTPUT_DESCRIPTION_MUTABLE_SINCE_VERSION 3
 
+// Each resource can advertise a different client projection. Keep the last
+// geometry here, including for ordinary clients and newly bound resources.
+struct output_resource_state {
+	bool initialized;
+	bool needs_done;
+	int32_t x, y, width, height;
+};
+
 static void output_handle_destroy(struct wl_client *client,
 		struct wl_resource *resource) {
 	wl_resource_destroy(resource);
@@ -22,17 +30,43 @@ static const struct zxdg_output_v1_interface output_implementation = {
 
 static void output_handle_resource_destroy(struct wl_resource *resource) {
 	wl_list_remove(wl_resource_get_link(resource));
+	free(wl_resource_get_user_data(resource));
 }
 
-static void output_send_details(struct wlr_xdg_output_v1 *xdg_output,
+static bool output_send_details(struct wlr_xdg_output_v1 *xdg_output,
 		struct wl_resource *resource) {
-	zxdg_output_v1_send_logical_position(resource,
-		xdg_output->x, xdg_output->y);
-	zxdg_output_v1_send_logical_size(resource,
-		xdg_output->width, xdg_output->height);
+	struct output_resource_state *state = wl_resource_get_user_data(resource);
+	struct wlr_output *output = xdg_output->layout_output->output;
+	struct wl_client *client = wl_resource_get_client(resource);
+	struct wlr_output_client_projection projection = {
+		.x = xdg_output->x, .y = xdg_output->y,
+		.width = xdg_output->width, .height = xdg_output->height,
+	};
+	wlr_output_get_client_projection(output, client, &projection);
+	bool position_changed = !state->initialized ||
+		state->x != projection.x || state->y != projection.y;
+	bool size_changed = !state->initialized ||
+		state->width != projection.width || state->height != projection.height;
+	if (!position_changed && !size_changed) {
+		return false;
+	}
+	if (position_changed) {
+		zxdg_output_v1_send_logical_position(resource,
+			projection.x, projection.y);
+	}
+	if (size_changed) {
+		zxdg_output_v1_send_logical_size(resource,
+			projection.width, projection.height);
+	}
+	state->initialized = true;
+	state->x = projection.x;
+	state->y = projection.y;
+	state->width = projection.width;
+	state->height = projection.height;
 	if (wl_resource_get_version(resource) < OUTPUT_DONE_DEPRECATED_SINCE_VERSION) {
 		zxdg_output_v1_send_done(resource);
 	}
+	return true;
 }
 
 static void output_update(struct wlr_xdg_output_v1 *xdg_output) {
@@ -101,8 +135,14 @@ static void output_manager_handle_get_xdg_output(struct wl_client *client,
 		wl_client_post_no_memory(client);
 		return;
 	}
+	struct output_resource_state *state = calloc(1, sizeof(*state));
+	if (!state) {
+		wl_resource_destroy(xdg_output_resource);
+		wl_client_post_no_memory(client);
+		return;
+	}
 	wl_resource_set_implementation(xdg_output_resource, &output_implementation,
-		NULL, output_handle_resource_destroy);
+		state, output_handle_resource_destroy);
 
 	if (output == NULL) {
 		wl_list_init(wl_resource_get_link(xdg_output_resource));
@@ -213,6 +253,45 @@ static void output_manager_send_details(
 	struct wlr_xdg_output_v1 *output;
 	wl_list_for_each(output, &manager->outputs, link) {
 		output_update(output);
+	}
+}
+
+void wlr_xdg_output_manager_v1_update(
+		struct wlr_xdg_output_manager_v1 *manager) {
+	struct wlr_xdg_output_v1 *output;
+	wl_list_for_each(output, &manager->outputs, link) {
+		struct wlr_output *wlr_output = output->layout_output->output;
+		struct wl_resource *resource;
+		wl_resource_for_each(resource, &output->resources) {
+			struct output_resource_state *state = wl_resource_get_user_data(resource);
+			struct wlr_output_client_projection projection;
+			state->needs_done = false;
+			// Logical clients are already updated by the layout listener. This
+			// explicit refresh is only for compositor-owned client projections.
+			if (!wlr_output_get_client_projection(wlr_output,
+					wl_resource_get_client(resource), &projection)) {
+				continue;
+			}
+			state->needs_done = output_send_details(output, resource) &&
+				wl_resource_get_version(resource) >= OUTPUT_DONE_DEPRECATED_SINCE_VERSION;
+		}
+		// Complete only affected clients, once per wl_output resource even if
+		// that client bound several xdg-output resources. Do not schedule the
+		// global done broadcast for a client-specific projection refresh.
+		struct wl_resource *output_resource;
+		wl_resource_for_each(output_resource, &wlr_output->resources) {
+			if (wl_resource_get_version(output_resource) < WL_OUTPUT_DONE_SINCE_VERSION) {
+				continue;
+			}
+			wl_resource_for_each(resource, &output->resources) {
+				struct output_resource_state *state = wl_resource_get_user_data(resource);
+				if (state->needs_done && wl_resource_get_client(resource) ==
+						wl_resource_get_client(output_resource)) {
+					wl_output_send_done(output_resource);
+					break;
+				}
+			}
+		}
 	}
 }
 

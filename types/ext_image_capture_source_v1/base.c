@@ -11,6 +11,8 @@
 #include <wlr/util/log.h>
 #include "ext-image-capture-source-v1-protocol.h"
 #include "render/wlr_renderer.h"
+#include "types/capture_output.h"
+#include "types/screencopy_sdr.h"
 
 static void source_handle_destroy(struct wl_client *client,
 		struct wl_resource *source_resource) {
@@ -97,66 +99,75 @@ static uint32_t get_swapchain_shm_format(struct wlr_swapchain *swapchain,
 	return format;
 }
 
-static void add_drm_format(struct wlr_drm_format_set *set, const struct wlr_drm_format *fmt) {
+static bool add_drm_format(struct wlr_drm_format_set *set, const struct wlr_drm_format *fmt) {
 	for (size_t i = 0; i < fmt->len; i++) {
-		wlr_drm_format_set_add(set, fmt->format, fmt->modifiers[i]);
+		if (!wlr_drm_format_set_add(set, fmt->format, fmt->modifiers[i])) {
+			return false;
+		}
 	}
+	return true;
+}
+
+bool capture_source_set_constraints(struct wlr_ext_image_capture_source_v1 *source,
+		struct wlr_swapchain *swapchain, struct wlr_renderer *renderer, bool sdr_fallback) {
+	// Prepare the complete replacement before notifying any sessions. In
+	// particular, an unavailable read format must clear old SHM constraints.
+	uint32_t native = get_swapchain_shm_format(swapchain, renderer);
+	size_t len = native == DRM_FORMAT_INVALID ? 0 :
+		(sdr_fallback && screencopy_is_10bit(native) ? 2 : 1);
+	uint32_t *formats = len ? calloc(len, sizeof(*formats)) : NULL;
+	struct wlr_drm_format_set dmabuf = {0};
+	dev_t device = 0;
+	if (len && !formats) {
+		return false;
+	}
+	if (len) {
+		formats[0] = native;
+		if (len == 2) {
+			formats[1] = DRM_FORMAT_XRGB8888;
+		}
+	}
+	int drm_fd = wlr_renderer_get_drm_fd(renderer);
+	if (swapchain->allocator &&
+			(swapchain->allocator->buffer_caps & WLR_BUFFER_CAP_DMABUF) && drm_fd >= 0) {
+		struct stat st;
+		if (fstat(drm_fd, &st) != 0) {
+			goto error;
+		}
+		device = st.st_rdev;
+		if (!add_drm_format(&dmabuf, &swapchain->format)) {
+			goto error;
+		}
+		const struct wlr_drm_format_set *render_formats = wlr_renderer_get_render_formats(renderer);
+		assert(render_formats);
+		uint32_t fallbacks[] = {DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888};
+		for (size_t i = 0; i < sizeof(fallbacks) / sizeof(fallbacks[0]); i++) {
+			const struct wlr_drm_format *fmt = wlr_drm_format_set_get(render_formats, fallbacks[i]);
+			if (fmt && swapchain->format.format != fmt->format && !add_drm_format(&dmabuf, fmt)) {
+				goto error;
+			}
+		}
+	}
+	free(source->shm_formats);
+	wlr_drm_format_set_finish(&source->dmabuf_formats);
+	source->shm_formats = formats;
+	source->shm_formats_len = len;
+	source->dmabuf_formats = dmabuf;
+	source->dmabuf_device = device;
+	source->width = swapchain->width;
+	source->height = swapchain->height;
+	wl_signal_emit_mutable(&source->events.constraints_update, NULL);
+	return true;
+error:
+	free(formats);
+	wlr_drm_format_set_finish(&dmabuf);
+	return false;
 }
 
 bool wlr_ext_image_capture_source_v1_set_constraints_from_swapchain(struct wlr_ext_image_capture_source_v1 *source,
 		struct wlr_swapchain *swapchain, struct wlr_renderer *renderer) {
-	source->width = swapchain->width;
-	source->height = swapchain->height;
-
-	uint32_t shm_format = get_swapchain_shm_format(swapchain, renderer);
-	if (shm_format != DRM_FORMAT_INVALID) {
-		uint32_t *shm_formats = calloc(1, sizeof(shm_formats[0]));
-		if (shm_formats == NULL) {
-			wlr_log(WLR_ERROR, "Allocation failed");
-			return false;
-		}
-		shm_formats[0] = shm_format;
-
-		source->shm_formats_len = 1;
-		free(source->shm_formats);
-		source->shm_formats = shm_formats;
-	}
-
-	int drm_fd = wlr_renderer_get_drm_fd(renderer);
-	if (swapchain->allocator != NULL &&
-			(swapchain->allocator->buffer_caps & WLR_BUFFER_CAP_DMABUF) &&
-			drm_fd >= 0) {
-		struct stat dev_stat;
-		if (fstat(drm_fd, &dev_stat) != 0) {
-			wlr_log_errno(WLR_ERROR, "fstat() failed");
-			return false;
-		}
-
-		source->dmabuf_device = dev_stat.st_rdev;
-
-		wlr_drm_format_set_finish(&source->dmabuf_formats);
-		source->dmabuf_formats = (struct wlr_drm_format_set){0};
-
-		add_drm_format(&source->dmabuf_formats, &swapchain->format);
-
-		const struct wlr_drm_format_set *render_formats =
-			wlr_renderer_get_render_formats(renderer);
-		assert(render_formats != NULL);
-
-		// Not all clients support fancy formats. Always ensure we provide
-		// support for ARGB8888 and XRGB8888 for simple clients.
-		uint32_t fallback_formats[] = { DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888 };
-		for (size_t i = 0; i < sizeof(fallback_formats) / sizeof(fallback_formats[0]); i++) {
-			const struct wlr_drm_format *fmt =
-				wlr_drm_format_set_get(render_formats, fallback_formats[i]);
-			if (fmt != NULL && swapchain->format.format != fmt->format) {
-				add_drm_format(&source->dmabuf_formats, fmt);
-			}
-		}
-	}
-
-	wl_signal_emit_mutable(&source->events.constraints_update, NULL);
-	return true;
+	// Scene and cursor sources keep their own color and copy semantics.
+	return capture_source_set_constraints(source, swapchain, renderer, false);
 }
 
 void wlr_ext_image_capture_source_v1_cursor_init(struct wlr_ext_image_capture_source_v1_cursor *source_cursor,

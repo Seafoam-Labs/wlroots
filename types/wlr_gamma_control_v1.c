@@ -67,7 +67,12 @@ static void gamma_control_handle_set_gamma(struct wl_client *client,
 		goto error_fd;
 	}
 
-	size_t table_size = gamma_control->ramp_size * 3 * sizeof(uint16_t);
+	if (!wlr_aqueous_gamma_allowed(gamma_control->output)) {
+        wlr_gamma_control_v1_send_failed_and_destroy(gamma_control);
+        goto error_fd;
+    }
+
+    size_t table_size = gamma_control->ramp_size * 3 * sizeof(uint16_t);
 
 	// Refuse to block when reading
 	int fd_flags = fcntl(fd, F_GETFL, 0);
@@ -151,7 +156,7 @@ static void gamma_control_manager_get_gamma_control(struct wl_client *client,
 	wl_resource_set_implementation(resource, &gamma_control_impl,
 		NULL, gamma_control_handle_resource_destroy);
 
-	if (output == NULL) {
+	if (output == NULL || !wlr_aqueous_gamma_allowed(output)) {
 		zwlr_gamma_control_v1_send_failed(resource);
 		return;
 	}
@@ -187,6 +192,7 @@ static void gamma_control_manager_get_gamma_control(struct wl_client *client,
 		gamma_control_handle_output_destroy;
 
 	wl_list_insert(&manager->controls, &gamma_control->link);
+	wlr_aqueous_gamma_changed(output);
 	zwlr_gamma_control_v1_send_gamma_size(gamma_control->resource, gamma_size);
 }
 

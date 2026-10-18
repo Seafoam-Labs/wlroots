@@ -524,7 +524,7 @@ void vulkan_format_props_query(struct wlr_vk_device *dev,
 	};
 	VkFormatProperties2 fmtp = {
 		.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-		.pNext = &modp,
+		.pNext = dev->dmabuf ? &modp : NULL,
 	};
 
 	vkGetPhysicalDeviceFormatProperties2(dev->phdev, format->vk, &fmtp);

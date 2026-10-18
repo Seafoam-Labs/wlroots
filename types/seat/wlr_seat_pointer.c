@@ -6,6 +6,49 @@
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/util/log.h>
 #include "types/wlr_seat.h"
+#include "types/pointer_enter_serial.h"
+
+// A private destroy listener avoids changing the public seat-client ABI.
+struct pointer_enter_history {
+	struct wl_listener destroy;
+	struct pointer_enter_serials serials;
+};
+
+static void pointer_enter_history_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct pointer_enter_history *history = wl_container_of(listener, history, destroy);
+	wl_list_remove(&history->destroy.link);
+	free(history);
+}
+
+static struct pointer_enter_history *pointer_enter_history_get(struct wlr_seat_client *client) {
+	struct wl_listener *listener = wl_signal_get(&client->events.destroy,
+		pointer_enter_history_destroy);
+	return listener == NULL ? NULL : wl_container_of(listener,
+		(struct pointer_enter_history *)NULL, destroy);
+}
+
+static void pointer_enter_record(struct wlr_seat_client *client, uint32_t serial) {
+	struct pointer_enter_history *history = pointer_enter_history_get(client);
+	if (history == NULL) {
+		history = calloc(1, sizeof(*history));
+		if (history == NULL) {
+			wl_client_post_no_memory(client->client);
+			return;
+		}
+		history->destroy.notify = pointer_enter_history_destroy;
+		wl_signal_add(&client->events.destroy, &history->destroy);
+	}
+	pointer_enter_serials_record(&history->serials, serial);
+}
+
+bool wlr_seat_client_validate_pointer_enter_serial(struct wlr_seat_client *client,
+		uint32_t serial) {
+	struct pointer_enter_history *history = pointer_enter_history_get(client);
+	return history != NULL && pointer_enter_serials_validate(&history->serials,
+		serial, wl_display_get_serial(wl_client_get_display(client->client)));
+}
+
 
 static void default_pointer_enter(struct wlr_seat_pointer_grab *grab,
 		struct wlr_surface *surface, double sx, double sy) {
@@ -188,6 +231,7 @@ void wlr_seat_pointer_enter(struct wlr_seat *wlr_seat,
 				continue;
 			}
 
+			pointer_enter_record(client, serial);
 			wl_pointer_send_enter(resource, serial, surface->resource,
 				wl_fixed_from_double(sx), wl_fixed_from_double(sy));
 			pointer_send_frame(resource);
@@ -575,6 +619,7 @@ void seat_client_create_pointer(struct wlr_seat_client *seat_client,
 					continue;
 				}
 
+				pointer_enter_record(focused_client, serial);
 				wl_pointer_send_enter(resource, serial, focused_surface->resource,
 					wl_fixed_from_double(sx), wl_fixed_from_double(sy));
 				pointer_send_frame(resource);

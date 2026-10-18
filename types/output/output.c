@@ -14,6 +14,25 @@
 
 #define OUTPUT_VERSION 4
 
+static wlr_output_client_projection_func_t client_projection_handler = NULL;
+static void *client_projection_data = NULL;
+
+void wlr_output_set_client_projection_handler(
+		wlr_output_client_projection_func_t handler, void *data) {
+	client_projection_handler = handler;
+	client_projection_data = data;
+}
+
+bool wlr_output_get_client_projection(struct wlr_output *output,
+		struct wl_client *client,
+		struct wlr_output_client_projection *projection) {
+	if (client_projection_handler == NULL) {
+		return false;
+	}
+	return client_projection_handler(output, client, projection,
+		client_projection_data);
+}
+
 static void send_geometry(struct wl_resource *resource) {
 	struct wlr_output *output = wlr_output_from_resource(resource);
 	wl_output_send_geometry(resource, 0, 0,
@@ -38,7 +57,13 @@ static void send_scale(struct wl_resource *resource) {
 	struct wlr_output *output = wlr_output_from_resource(resource);
 	uint32_t version = wl_resource_get_version(resource);
 	if (version >= WL_OUTPUT_SCALE_SINCE_VERSION) {
-		wl_output_send_scale(resource, (uint32_t)ceil(output->scale));
+		struct wlr_output_client_projection projection;
+		struct wl_client *client = wl_resource_get_client(resource);
+		if (wlr_output_get_client_projection(output, client, &projection)) {
+			wl_output_send_scale(resource, projection.scale);
+		} else {
+			wl_output_send_scale(resource, (uint32_t)ceil(output->scale));
+		}
 	}
 }
 
@@ -523,6 +548,13 @@ const struct wlr_output_image_description *output_pending_image_description(
 	return output->image_description;
 }
 
+// Aqueous: expose the EDID CTA-861 HDR static metadata parsed by the DRM
+// backend.
+const struct wlr_output_edid_hdr_static_metadata *
+wlr_output_get_edid_hdr_static_metadata(struct wlr_output *output) {
+	return &output->edid_hdr_static_metadata;
+}
+
 /**
  * Compare a struct wlr_output_state with the current state of a struct
  * wlr_output.
@@ -743,7 +775,33 @@ bool wlr_output_test_state(struct wlr_output *output,
 	return success;
 }
 
+static bool (*aqueous_color_commit)(struct wlr_output *, const struct wlr_output_state *, void *);
+static bool (*aqueous_color_gamma)(struct wlr_output *, void *);
+static void (*aqueous_gamma_changed)(struct wlr_output *, void *);
+static void *aqueous_color_data;
+
+void wlr_aqueous_set_color_guard(
+        bool (*commit)(struct wlr_output *, const struct wlr_output_state *, void *),
+        bool (*gamma)(struct wlr_output *, void *),
+        void (*gamma_changed)(struct wlr_output *, void *), void *data) {
+    aqueous_color_commit = commit;
+    aqueous_color_gamma = gamma;
+    aqueous_gamma_changed = gamma_changed;
+    aqueous_color_data = data;
+}
+
+bool wlr_aqueous_gamma_allowed(struct wlr_output *output) {
+    return !aqueous_color_gamma || aqueous_color_gamma(output, aqueous_color_data);
+}
+
+void wlr_aqueous_gamma_changed(struct wlr_output *output) {
+    if (aqueous_gamma_changed) aqueous_gamma_changed(output, aqueous_color_data);
+}
+
 bool output_prepare_commit(struct wlr_output *output, const struct wlr_output_state *state) {
+    if (aqueous_color_commit && !aqueous_color_commit(output, state, aqueous_color_data)) {
+        return false;
+    }
 	if (!output_basic_test(output, state)) {
 		wlr_log(WLR_ERROR, "Basic output test failed for %s", output->name);
 		return false;
@@ -810,6 +868,9 @@ bool wlr_output_commit_state(struct wlr_output *output,
 	}
 
 	if (!output_prepare_commit(output, &pending)) {
+		if (new_back_buffer) {
+			wlr_buffer_unlock(pending.buffer);
+		}
 		return false;
 	}
 

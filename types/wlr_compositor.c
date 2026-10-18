@@ -1,4 +1,9 @@
 #include <assert.h>
+#include <wlr/types/wlr_fifo_v1.h>
+#include "types/wlr_fifo_v1.h"
+#include "types/wlr_commit_timing_v1.h"
+#include "types/wlr_surface_guard.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wayland-server-core.h>
@@ -497,6 +502,7 @@ static void surface_cache_pending(struct wlr_surface *surface) {
 	wl_list_insert(surface->cached.prev, &cached->cached_state_link);
 
 	surface->pending.seq++;
+	commit_timing_changed(surface);
 
 	return;
 
@@ -509,14 +515,17 @@ error:
 }
 
 static void surface_commit_state(struct wlr_surface *surface,
-		struct wlr_surface_state *next) {
+		struct wlr_surface_state *next, struct commit_timing_immediate *frame) {
 	assert(next->cached_state_locks == 0);
+	struct surface_guard guard;
+	surface_guard_init(&guard, surface);
 
 	bool invalid_buffer = next->committed & WLR_SURFACE_STATE_BUFFER;
 
 	if (invalid_buffer && next->buffer == NULL) {
 		surface->unmap_commit = surface->mapped;
 		wlr_surface_unmap(surface);
+		if (!guard.alive) return;
 	} else {
 		surface->unmap_commit = false;
 	}
@@ -534,15 +543,22 @@ static void surface_commit_state(struct wlr_surface *surface,
 	if (invalid_buffer) {
 		surface_apply_damage(surface);
 	}
+	if (frame) commit_timing_finish_immediate(frame);
+	else commit_timing_apply(surface);
+	if (!guard.alive) return;
 	surface_update_opaque_region(surface);
 	surface_update_input_region(surface);
 
+	bool managed = frame || ((!wl_list_empty(&surface->current.subsurfaces_below) ||
+		!wl_list_empty(&surface->current.subsurfaces_above)) && commit_timing_managed(surface));
 	struct wlr_subsurface *subsurface;
 	wl_list_for_each(subsurface, &surface->current.subsurfaces_below, current.link) {
-		subsurface_handle_parent_commit(subsurface);
+		subsurface_handle_parent_commit(subsurface, managed);
+		if (!guard.alive) return;
 	}
 	wl_list_for_each(subsurface, &surface->current.subsurfaces_above, current.link) {
-		subsurface_handle_parent_commit(subsurface);
+		subsurface_handle_parent_commit(subsurface, managed);
+		if (!guard.alive) return;
 	}
 
 	// If we're committing the pending state, bump the pending sequence number
@@ -555,21 +571,36 @@ static void surface_commit_state(struct wlr_surface *surface,
 	wl_list_for_each(synced, &surface->synced, link) {
 		if (synced->impl->commit) {
 			synced->impl->commit(synced);
+			if (!guard.alive) return;
 		}
 	}
 
 	if (surface->role != NULL && surface->role->commit != NULL &&
 			(surface->role_resource != NULL || surface->role->no_object)) {
 		surface->role->commit(surface);
+		if (!guard.alive) return;
 	}
 
 	wl_signal_emit_mutable(&surface->events.commit, surface);
+	if (!guard.alive) return;
+	wlr_addon_finish(&guard.addon);
 
 	// Release the buffer after emitting the commit event, so that listeners can
 	// access it. Don't leave the buffer locked so that wl_shm buffers can be
 	// released immediately on commit when they are uploaded to the GPU.
 	wlr_buffer_unlock(surface->current.buffer);
 	surface->current.buffer = NULL;
+}
+
+/* Keep the bounded stack frame off the plain-surface commit path. */
+static bool surface_try_immediate(struct wlr_surface *surface) {
+	struct commit_timing_immediate frame;
+	if (!commit_timing_prepare_immediate(surface, &frame)) return false;
+	surface_commit_state(surface, &surface->pending, &frame);
+	/* Also releases outstanding locks if unmap callbacks destroyed the parent
+	 * before child application. The frame never outlives this stack invocation. */
+	commit_timing_finish_immediate(&frame);
+	return true;
 }
 
 static void surface_handle_commit(struct wl_client *client,
@@ -591,10 +622,15 @@ static void surface_handle_commit(struct wl_client *client,
 		return;
 	}
 
-	if (surface->pending.cached_state_locks > 0 || !wl_list_empty(&surface->cached)) {
+	if ((!wl_list_empty(&surface->pending.subsurfaces_below) ||
+			!wl_list_empty(&surface->pending.subsurfaces_above)) && surface_try_immediate(surface)) return;
+	if (!commit_timing_capture(surface)) return;
+	if (surface->pending.cached_state_locks > 0 || !wl_list_empty(&surface->cached) ||
+			!commit_timing_ready(surface, &surface->pending) ||
+			!fifo_v1_state_ready(surface, &surface->pending)) {
 		surface_cache_pending(surface);
 	} else {
-		surface_commit_state(surface, &surface->pending);
+		surface_commit_state(surface, &surface->pending, NULL);
 	}
 }
 
@@ -944,6 +980,8 @@ uint32_t wlr_surface_lock_pending(struct wlr_surface *surface) {
 	return surface->pending.seq;
 }
 
+static void surface_flush_cached_notify(struct wlr_surface *surface, bool notify);
+
 void wlr_surface_unlock_cached(struct wlr_surface *surface, uint32_t seq) {
 	if (surface->pending.seq == seq) {
 		assert(surface->pending.cached_state_locks > 0);
@@ -965,25 +1003,63 @@ void wlr_surface_unlock_cached(struct wlr_surface *surface, uint32_t seq) {
 	cached->cached_state_locks--;
 
 	if (cached->cached_state_locks != 0) {
+		commit_timing_changed(surface);
 		return;
 	}
 
 	if (cached->cached_state_link.prev != &surface->cached) {
 		// This isn't the first cached state. This means we're blocked on a
 		// previous cached state.
+		commit_timing_changed(surface);
 		return;
 	}
 
-	// TODO: consider merging all committed states together
-	struct wlr_surface_state *next, *tmp;
-	wl_list_for_each_safe(next, tmp, &surface->cached, cached_state_link) {
-		if (next->cached_state_locks > 0) {
+	surface_flush_cached_notify(surface, true);
+}
+
+struct surface_flush_guard {
+	struct wlr_addon addon;
+	bool alive;
+};
+
+static void surface_flush_guard_destroy(struct wlr_addon *addon) {
+	struct surface_flush_guard *guard = wl_container_of(addon, guard, addon);
+	guard->alive = false;
+	wlr_addon_finish(addon);
+}
+
+static const struct wlr_addon_interface surface_flush_guard_impl = {
+	.name = "surface_flush_cached",
+	.destroy = surface_flush_guard_destroy,
+};
+
+static void surface_flush_cached_notify(struct wlr_surface *surface, bool notify) {
+	// Presentation or another lock's completion may reenter from a commit
+	// listener. The outer drain reevaluates the next head after that listener.
+	if (wlr_addon_find(&surface->addons, NULL, &surface_flush_guard_impl)) {
+		if (notify) commit_timing_changed(surface);
+		return;
+	}
+	struct surface_flush_guard guard = {.alive = true};
+	wlr_addon_init(&guard.addon, &surface->addons, NULL, &surface_flush_guard_impl);
+	while (!wl_list_empty(&surface->cached)) {
+		struct wlr_surface_state *next = wl_container_of(surface->cached.next,
+			next, cached_state_link);
+		if (next->cached_state_locks > 0 || !commit_timing_ready(surface, next) ||
+				!fifo_v1_state_ready(surface, next)) {
 			break;
 		}
 
-		surface_commit_state(surface, next);
+		surface_commit_state(surface, next, NULL);
+		if (!guard.alive) return;
 		surface_state_destroy_cached(next, surface);
 	}
+	if (notify) commit_timing_changed(surface);
+	wlr_addon_finish(&guard.addon);
+}
+
+void surface_flush_cached(struct wlr_surface *surface) {
+	surface_flush_cached_notify(surface, false);
 }
 
 struct wlr_surface *wlr_surface_get_root_surface(struct wlr_surface *surface) {
@@ -1049,6 +1125,7 @@ struct wlr_surface *wlr_surface_surface_at(struct wlr_surface *surface,
 }
 
 static void surface_output_destroy(struct wlr_surface_output *surface_output) {
+	wlr_fifo_v1_surface_changed(surface_output->surface);
 	wl_list_remove(&surface_output->bind.link);
 	wl_list_remove(&surface_output->destroy.link);
 	wl_list_remove(&surface_output->link);
@@ -1278,6 +1355,75 @@ void wlr_surface_set_preferred_buffer_scale(struct wlr_surface *surface,
 
 	wl_surface_send_preferred_buffer_scale(surface->resource, scale);
 	surface->preferred_buffer_scale = scale;
+}
+
+struct surface_preferred_scale_override {
+	struct wlr_addon addon;
+	double scale;
+};
+
+static void preferred_scale_override_destroy(struct wlr_addon *addon) {
+	struct surface_preferred_scale_override *state =
+		wl_container_of(addon, state, addon);
+	wlr_addon_finish(&state->addon);
+	free(state);
+}
+
+static const struct wlr_addon_interface preferred_scale_override_impl = {
+	.name = "wlr_surface_preferred_scale_override",
+	.destroy = preferred_scale_override_destroy,
+};
+
+static struct surface_preferred_scale_override *
+get_direct_preferred_scale_override(struct wlr_surface *surface) {
+	struct wlr_addon *addon = wlr_addon_find(&surface->addons, surface,
+		&preferred_scale_override_impl);
+	if (addon == NULL) {
+		return NULL;
+	}
+	struct surface_preferred_scale_override *state =
+		wl_container_of(addon, state, addon);
+	return state;
+}
+
+void wlr_surface_set_preferred_scale_override(struct wlr_surface *surface,
+		double scale) {
+	assert(scale >= 0.0 && isfinite(scale));
+	struct surface_preferred_scale_override *state =
+		get_direct_preferred_scale_override(surface);
+	if (scale == 0.0) {
+		if (state != NULL) {
+			preferred_scale_override_destroy(&state->addon);
+		}
+		return;
+	}
+	if (state != NULL) {
+		state->scale = scale;
+		return;
+	}
+	state = calloc(1, sizeof(*state));
+	if (state == NULL) {
+		return;
+	}
+	state->scale = scale;
+	wlr_addon_init(&state->addon, &surface->addons, surface,
+		&preferred_scale_override_impl);
+}
+
+double wlr_surface_get_preferred_scale_override(struct wlr_surface *surface) {
+	struct surface_preferred_scale_override *state =
+		get_direct_preferred_scale_override(surface);
+	if (state != NULL) {
+		return state->scale;
+	}
+	struct wlr_surface *root = wlr_surface_get_root_surface(surface);
+	if (root != surface) {
+		state = get_direct_preferred_scale_override(root);
+		if (state != NULL) {
+			return state->scale;
+		}
+	}
+	return 0.0;
 }
 
 void wlr_surface_set_preferred_buffer_transform(struct wlr_surface *surface,

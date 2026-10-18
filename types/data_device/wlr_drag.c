@@ -9,6 +9,7 @@
 #include <wlr/types/wlr_seat.h>
 #include <wlr/util/log.h>
 #include "types/wlr_data_device.h"
+#include <wlr/types/wlr_xdg_toplevel_drag_v1.h>
 
 static void drag_handle_seat_client_destroy(struct wl_listener *listener,
 		void *data) {
@@ -29,6 +30,11 @@ static void drag_handle_focus_destroy(struct wl_listener *listener, void *data) 
 
 static void drag_set_focus(struct wlr_drag *drag,
 		struct wlr_surface *surface, double sx, double sy) {
+	// Another held button can keep the grab alive after the drop. New offers
+	// would overwrite the accepted/action state needed by the dropped offer.
+	if (drag->dropped && surface != NULL) {
+		return;
+	}
 	if (drag->focus == surface) {
 		return;
 	}
@@ -176,7 +182,12 @@ static void drag_destroy(struct wlr_drag *drag) {
 	if (drag->icon != NULL) {
 		drag_icon_destroy(drag->icon);
 	}
+	struct wlr_data_source *cancel_source = !drag->dropped &&
+		wlr_xdg_toplevel_drag_v1_try_from_data_source(drag->source) ? drag->source : NULL;
 	free(drag);
+	// Grab cancellation must end the source operation as well. Its drag
+	// listener is already removed, so cancellation cannot recurse into drag.
+	wlr_data_source_destroy(cancel_source);
 }
 
 static void drag_handle_pointer_enter(struct wlr_seat_pointer_grab *grab,
@@ -193,6 +204,9 @@ static void drag_handle_pointer_clear_focus(struct wlr_seat_pointer_grab *grab) 
 static void drag_handle_pointer_motion(struct wlr_seat_pointer_grab *grab,
 		uint32_t time, double sx, double sy) {
 	struct wlr_drag *drag = grab->data;
+	if (drag->dropped) {
+		return;
+	}
 	if (drag->focus != NULL && drag->focus_client != NULL) {
 		struct wl_resource *resource;
 		wl_resource_for_each(resource, &drag->focus_client->data_devices) {
@@ -290,10 +304,10 @@ static uint32_t drag_handle_touch_up(struct wlr_seat_touch_grab *grab,
 		return 0;
 	}
 
-	if (drag->focus_client && drag->source->current_dnd_action &&
+	if (drag->source && drag->focus_client && drag->source->current_dnd_action &&
 			drag->source->accepted) {
 		drag_drop(drag, time);
-	} else if (drag->source->impl->dnd_finish) {
+	} else if (drag->source && drag->source->impl->dnd_finish) {
 		// This will end the grab and free `drag`
 		wlr_data_source_destroy(drag->source);
 		return 0;
@@ -306,6 +320,9 @@ static uint32_t drag_handle_touch_up(struct wlr_seat_touch_grab *grab,
 static void drag_handle_touch_motion(struct wlr_seat_touch_grab *grab,
 		uint32_t time, struct wlr_touch_point *point) {
 	struct wlr_drag *drag = grab->data;
+	if (drag->dropped) {
+		return;
+	}
 	if (drag->focus && drag->focus_client) {
 		struct wl_resource *resource;
 		wl_resource_for_each(resource, &drag->focus_client->data_devices) {
@@ -341,6 +358,19 @@ static void drag_handle_clear_focus(struct wlr_seat_touch_grab *grab, uint32_t t
 	drag_set_focus(drag, NULL, 0, 0);
 }
 
+static void drag_handle_touch_wl_cancel(struct wlr_seat_touch_grab *grab,
+		struct wlr_seat_client *seat_client) {
+	struct wlr_drag *drag = grab->data;
+	if (drag->seat_client != seat_client) {
+		return;
+	}
+	if (drag->source) {
+		wlr_data_source_destroy(drag->source);
+	} else {
+		drag_destroy(drag);
+	}
+}
+
 static const struct wlr_touch_grab_interface
 		data_device_touch_drag_interface = {
 	.down = drag_handle_touch_down,
@@ -349,6 +379,7 @@ static const struct wlr_touch_grab_interface
 	.enter = drag_handle_touch_enter,
 	.cancel = drag_handle_touch_cancel,
 	.clear_focus = drag_handle_clear_focus,
+	.wl_cancel = drag_handle_touch_wl_cancel,
 };
 
 static void drag_handle_keyboard_enter(struct wlr_seat_keyboard_grab *grab,
@@ -396,6 +427,8 @@ static void drag_handle_icon_destroy(struct wl_listener *listener, void *data) {
 static void drag_handle_drag_source_destroy(struct wl_listener *listener,
 		void *data) {
 	struct wlr_drag *drag = wl_container_of(listener, drag, source_destroy);
+	wl_list_remove(&drag->source_destroy.link);
+	drag->source = NULL;
 	drag_destroy(drag);
 }
 
@@ -496,6 +529,9 @@ void wlr_seat_request_start_drag(struct wlr_seat *seat, struct wlr_drag *drag,
 	if (seat->drag != NULL) {
 		wlr_log(WLR_DEBUG, "Rejecting start_drag request, "
 			"another drag-and-drop operation is already in progress");
+		if (wlr_xdg_toplevel_drag_v1_try_from_data_source(drag->source)) {
+			wlr_data_source_destroy(drag->source);
+		}
 		return;
 	}
 
@@ -535,6 +571,7 @@ void wlr_seat_start_drag(struct wlr_seat *seat, struct wlr_drag *drag,
 		wl_signal_add(&drag->source->events.destroy, &seat->drag_source_destroy);
 	}
 
+	xdg_toplevel_drag_start(drag);
 	wl_signal_emit_mutable(&seat->events.start_drag, drag);
 }
 
@@ -555,7 +592,11 @@ void wlr_seat_start_touch_drag(struct wlr_seat *seat, struct wlr_drag *drag,
 	drag->touch_id = point->touch_id;
 
 	wlr_seat_touch_start_grab(seat, &drag->touch_grab);
-	drag_set_focus(drag, point->surface, point->sx, point->sy);
+	// An attached origin is not a drop target. The compositor will pick a
+	// target with the toplevel excluded once it receives start_drag.
+	if (!wlr_xdg_toplevel_drag_v1_try_from_data_source(drag->source)) {
+		drag_set_focus(drag, point->surface, point->sx, point->sy);
+	}
 
 	wlr_seat_start_drag(seat, drag, serial);
 }

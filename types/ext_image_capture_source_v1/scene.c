@@ -8,6 +8,8 @@
 #include <wlr/util/log.h>
 
 #include "types/wlr_output.h"
+#include "types/capture_output.h"
+#include "ext-image-copy-capture-v1-protocol.h"
 #include "types/wlr_scene.h"
 
 struct scene_node_source {
@@ -20,6 +22,7 @@ struct scene_node_source {
 	struct wlr_scene_output *scene_output;
 
 	size_t num_started;
+	bool frame_sdr;
 
 	struct wl_listener node_destroy;
 	struct wl_listener scene_output_destroy;
@@ -30,12 +33,21 @@ struct scene_node_source_frame_event {
 	struct wlr_ext_image_capture_source_v1_frame_event base;
 	struct wlr_buffer *buffer;
 	struct timespec when;
+	bool sdr;
 };
 
 static size_t last_output_num = 0;
 
 static void _get_scene_node_extents(struct wlr_scene_node *node, int lx, int ly,
 		int *x_min, int *y_min, int *x_max, int *y_max) {
+	if (!node->enabled) {
+		return;
+	}
+	if (node->type == WLR_SCENE_NODE_BUFFER &&
+			!wlr_scene_buffer_from_node(node)->buffer &&
+			!wlr_scene_buffer_from_node(node)->texture) {
+		return;
+	}
 	switch (node->type) {
 	case WLR_SCENE_NODE_TREE:;
 		struct wlr_scene_tree *scene_tree = wlr_scene_tree_from_node(node);
@@ -67,12 +79,60 @@ static void _get_scene_node_extents(struct wlr_scene_node *node, int lx, int ly,
 
 static void get_scene_node_extents(struct wlr_scene_node *node, struct wlr_box *box) {
 	int lx = 0, ly = 0;
-	wlr_scene_node_coords(node, &lx, &ly);
+	if (!wlr_scene_node_coords(node, &lx, &ly)) {
+		*box = (struct wlr_box){0};
+		return;
+	}
 	*box = (struct wlr_box){ .x = INT_MAX, .y = INT_MAX };
 	int x_max = INT_MIN, y_max = INT_MIN;
 	_get_scene_node_extents(node, lx, ly, &box->x, &box->y, &x_max, &y_max);
+	if (box->x == INT_MAX || box->y == INT_MAX) {
+		*box = (struct wlr_box){0};
+		return;
+	}
 	box->width = x_max - box->x;
 	box->height = y_max - box->y;
+}
+
+// The private output uses the scene renderer's default destination: sRGB
+// primaries and gamma 2.2. A renderer which ignores input color transforms can
+// only establish that encoding if every sampled buffer is already in it.
+static bool scene_sdr_inputs(struct wlr_scene_node *node, bool transforms) {
+	if (!node->enabled) {
+		return true;
+	}
+	if (node->type == WLR_SCENE_NODE_TREE) {
+		struct wlr_scene_node *child;
+		wl_list_for_each(child, &wlr_scene_tree_from_node(node)->children, link) {
+			if (!scene_sdr_inputs(child, transforms)) {
+				return false;
+			}
+		}
+	} else if (node->type == WLR_SCENE_NODE_BUFFER) {
+		struct wlr_scene_buffer *buffer = wlr_scene_buffer_from_node(node);
+		if (!buffer->buffer && !buffer->texture) {
+			return true;
+		}
+		bool sdr = (buffer->transfer_function == 0 ||
+			buffer->transfer_function == WLR_COLOR_TRANSFER_FUNCTION_GAMMA22) &&
+			(buffer->primaries == 0 || buffer->primaries == WLR_COLOR_NAMED_PRIMARIES_SRGB);
+		// Single-pixel buffers take the rect fast path, which doesn't apply
+		// the buffer's input color description, even on Vulkan.
+		if ((!transforms || buffer->is_single_pixel_buffer) && !sdr) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void source_fail_frame(struct scene_node_source *source) {
+	pixman_region32_t damage;
+	pixman_region32_init_rect(&damage, 0, 0,
+		source->base.width ? source->base.width : 1,
+		source->base.height ? source->base.height : 1);
+	struct scene_node_source_frame_event event = { .base.damage = &damage };
+	wl_signal_emit_mutable(&source->base.events.frame, &event.base);
+	pixman_region32_fini(&damage);
 }
 
 static void source_render(struct scene_node_source *source) {
@@ -81,11 +141,17 @@ static void source_render(struct scene_node_source *source) {
 	struct wlr_box extents;
 	get_scene_node_extents(source->node, &extents);
 
-	if (extents.width == 0 || extents.height == 0) {
+	if (extents.width <= 0 || extents.height <= 0) {
+		source_fail_frame(source);
 		return;
 	}
 
 	wlr_scene_output_set_position(scene_output, extents.x, extents.y);
+	struct wlr_renderer *renderer = source->output.renderer;
+	source->frame_sdr = source->output.image_description == NULL &&
+		scene_output->gamma_lut_color_transform == NULL &&
+		scene_sdr_inputs(&scene_output->scene->tree.node,
+			renderer->features.input_color_transform && renderer->features.output_color_transform);
 
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
@@ -96,7 +162,7 @@ static void source_render(struct scene_node_source *source) {
 	wlr_output_state_finish(&state);
 
 	if (!ok) {
-		// TODO: send failure
+		source_fail_frame(source);
 		return;
 	}
 }
@@ -134,6 +200,12 @@ static void source_stop(struct wlr_ext_image_capture_source_v1 *base) {
 static void source_request_frame(struct wlr_ext_image_capture_source_v1 *base,
 		bool schedule_frame) {
 	struct scene_node_source *source = wl_container_of(base, source, base);
+	struct wlr_box extents;
+	get_scene_node_extents(source->node, &extents);
+	if (extents.width <= 0 || extents.height <= 0) {
+		source_fail_frame(source);
+		return;
+	}
 	if (source->output.frame_pending) {
 		wlr_output_send_frame(&source->output);
 	}
@@ -148,8 +220,12 @@ static void source_copy_frame(struct wlr_ext_image_capture_source_v1 *base,
 	struct scene_node_source *source = wl_container_of(base, source, base);
 	struct scene_node_source_frame_event *event = wl_container_of(base_event, event, base);
 
-	if (wlr_ext_image_copy_capture_frame_v1_copy_buffer(frame,
-			event->buffer, source->output.renderer)) {
+	if (event->buffer == NULL) {
+		wlr_ext_image_copy_capture_frame_v1_fail(frame,
+			EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN);
+		return;
+	}
+	if (capture_copy_scene(frame, event->buffer, source->output.renderer, event->sdr)) {
 		wlr_ext_image_copy_capture_frame_v1_ready(frame,
 			source->output.transform, &event->when);
 	}
@@ -241,6 +317,7 @@ static bool output_commit(struct wlr_output *output, const struct wlr_output_sta
 		.base = { .damage = damage },
 		.buffer = buffer,
 		.when = now,
+		.sdr = source->frame_sdr,
 	};
 	wl_signal_emit_mutable(&source->base.events.frame, &frame_event.base);
 
@@ -319,10 +396,23 @@ struct wlr_ext_image_capture_source_v1 *wlr_ext_image_capture_source_v1_create_w
 	snprintf(name, sizeof(name), "CAPTURE-%zu", output_num);
 	wlr_output_set_name(&source->output, name);
 
-	wlr_output_init_render(&source->output, allocator, renderer);
+	if (!wlr_output_init_render(&source->output, allocator, renderer)) {
+		wlr_output_finish(&source->output);
+		wlr_backend_finish(&source->backend);
+		free(source);
+		return NULL;
+	}
+	// Never substitute a client buffer for the rendered SDR destination.
+	wlr_output_lock_attach_render(&source->output, true);
 
 	struct wlr_scene *scene = scene_node_get_root(node);
 	source->scene_output = wlr_scene_output_create(scene, &source->output);
+	if (!source->scene_output) {
+		wlr_output_finish(&source->output);
+		wlr_backend_finish(&source->backend);
+		free(source);
+		return NULL;
+	}
 
 	source->node_destroy.notify = source_handle_node_destroy;
 	wl_signal_add(&node->events.destroy, &source->node_destroy);

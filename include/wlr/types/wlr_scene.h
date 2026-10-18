@@ -9,6 +9,8 @@
 #ifndef WLR_TYPES_WLR_SCENE_H
 #define WLR_TYPES_WLR_SCENE_H
 
+#define WLR_AQUEOUS_OUTPUT_LAYER_PROMOTION_VERSION 3
+
 /**
  * The scene-graph API provides a declarative way to display surfaces. The
  * compositor creates a scene, adds surfaces, then renders the scene on
@@ -25,6 +27,7 @@
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_damage_ring.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
+#include <wlr/types/wlr_output_layer.h>
 #include <wlr/util/addon.h>
 #include <wlr/util/box.h>
 
@@ -37,8 +40,13 @@ struct wlr_drag_icon;
 struct wlr_surface;
 
 struct wlr_scene_node;
+struct wlr_scene_rect;
 struct wlr_scene_buffer;
 struct wlr_scene_output_layout;
+struct wlr_render_pass;
+struct wlr_render_texture_options;
+struct wlr_render_rect_options;
+struct wlr_vk_render_texture_attribs;
 
 struct wlr_presentation;
 struct wlr_linux_dmabuf_v1;
@@ -48,6 +56,29 @@ struct wlr_output_state;
 
 typedef bool (*wlr_scene_buffer_point_accepts_input_func_t)(
 	struct wlr_scene_buffer *buffer, double *sx, double *sy);
+
+typedef bool (*wlr_scene_buffer_render_hook_func_t)(
+	struct wlr_scene_buffer *scene_buffer,
+	const struct wlr_render_texture_options *options,
+	const struct wlr_vk_render_texture_attribs *attribs, void *data);
+
+typedef bool (*wlr_scene_rect_render_hook_func_t)(
+	struct wlr_render_pass *render_pass, struct wlr_scene_rect *scene_rect,
+	const struct wlr_render_rect_options *options, void *data);
+
+typedef bool (*wlr_scene_buffer_needs_composition_func_t)(
+	struct wlr_scene_buffer *scene_buffer, void *data);
+
+typedef uint32_t (*wlr_scene_render_begin_hook_func_t)(
+	struct wlr_render_pass *render_pass,
+	const pixman_region32_t *content_damage, void *data);
+
+typedef void (*wlr_scene_node_render_hook_func_t)(
+	struct wlr_render_pass *render_pass, struct wlr_scene_node *node,
+	const pixman_region32_t *render_region, void *data);
+
+typedef void (*wlr_scene_damage_hook_func_t)(
+	struct wlr_scene_node *source, const pixman_region32_t *damage, void *data);
 
 typedef void (*wlr_scene_buffer_iterator_func_t)(
 	struct wlr_scene_buffer *buffer, int sx, int sy, void *user_data);
@@ -143,6 +174,8 @@ struct wlr_scene_rect {
 	struct wlr_scene_node node;
 	int width, height;
 	float color[4];
+	bool force_blend;
+	bool input_enabled;
 };
 
 struct wlr_scene_outputs_update_event {
@@ -197,6 +230,7 @@ struct wlr_scene_buffer {
 	enum wlr_color_named_primaries primaries;
 	enum wlr_color_encoding color_encoding;
 	enum wlr_color_range color_range;
+	bool force_blend;
 
 	struct {
 		uint64_t active_outputs;
@@ -238,6 +272,7 @@ struct wlr_scene_output {
 
 	struct {
 		pixman_region32_t pending_commit_damage;
+		pixman_region32_t pending_effect_damage;
 
 		uint8_t index;
 
@@ -270,6 +305,22 @@ struct wlr_scene_output {
 		uint64_t in_point;
 		struct wlr_drm_syncobj_timeline *out_timeline;
 		uint64_t out_point;
+
+		wlr_scene_buffer_render_hook_func_t buffer_render_hook;
+		wlr_scene_rect_render_hook_func_t rect_render_hook;
+		wlr_scene_buffer_needs_composition_func_t buffer_needs_composition;
+		wlr_scene_render_begin_hook_func_t render_begin_hook;
+		wlr_scene_node_render_hook_func_t node_render_hook;
+		void *render_hook_data;
+		wlr_scene_damage_hook_func_t damage_hook;
+		void *damage_hook_data;
+		/* C-owned tail: preserve the existing Zig binding prefix. */
+		struct wlr_swapchain *color_pipeline_swapchain;
+		struct wlr_color_transform *color_pipeline_identity;
+		bool color_pipeline_composed;
+		unsigned color_pipeline_retry_frames;
+		uint64_t color_pipeline_scanout_key;
+		unsigned color_pipeline_scanout_retry_frames;
 	} WLR_PRIVATE;
 };
 
@@ -305,6 +356,14 @@ void wlr_scene_node_set_enabled(struct wlr_scene_node *node, bool enabled);
  */
 void wlr_scene_node_set_position(struct wlr_scene_node *node, int x, int y);
 /**
+ * Set a precise logical position for the node relative to its parent.
+ *
+ * Precise coordinates are retained until output rendering, where their edges
+ * are rounded to physical pixels. Integer scene APIs remain ABI-compatible.
+ */
+void wlr_scene_node_set_position_f64(struct wlr_scene_node *node,
+	double x, double y);
+/**
  * Move the node right above the specified sibling.
  * Asserts that node and sibling are distinct and share the same parent.
  */
@@ -335,6 +394,11 @@ void wlr_scene_node_reparent(struct wlr_scene_node *node,
  * True is returned if the node and all of its ancestors are enabled.
  */
 bool wlr_scene_node_coords(struct wlr_scene_node *node, int *lx, int *ly);
+/**
+ * Get the node's precise layout-local coordinates.
+ */
+bool wlr_scene_node_coords_f64(struct wlr_scene_node *node,
+	double *lx, double *ly);
 /**
  * Call `iterator` on each buffer in the scene-graph, with the buffer's
  * position in layout coordinates. The function is called from root to leaves
@@ -448,6 +512,21 @@ struct wlr_scene_surface *wlr_scene_surface_try_from_buffer(
  */
 void wlr_scene_surface_send_frame_done(struct wlr_scene_surface *scene_surface,
 	const struct timespec *when);
+/**
+ * Project a surface rendered in physical-pixel coordinates into logical scene
+ * coordinates. Hit testing is transformed back into surface coordinates.
+ */
+void wlr_scene_surface_set_destination_scale(
+	struct wlr_scene_surface *scene_surface, double scale);
+double wlr_scene_surface_get_destination_scale(
+	struct wlr_scene_surface *scene_surface);
+/**
+ * Convert surface-local coordinates to the projected destination coordinate
+ * system used by the scene node.
+ */
+void wlr_scene_surface_map_point_to_destination(
+	struct wlr_scene_surface *scene_surface, double sx, double sy,
+	double *dx, double *dy);
 
 /**
  * Add a node displaying a solid-colored rectangle to the scene-graph.
@@ -468,6 +547,18 @@ void wlr_scene_rect_set_size(struct wlr_scene_rect *rect, int width, int height)
  * The color argument must be a premultiplied color value.
  */
 void wlr_scene_rect_set_color(struct wlr_scene_rect *rect, const float color[static 4]);
+
+/**
+ * Force compositing for a rectangle whose custom shader may produce transparency.
+ */
+void wlr_scene_rect_set_force_blend(struct wlr_scene_rect *rect,
+	int force_blend);
+
+/**
+ * Control whether a rectangle participates in scene hit-testing.
+ */
+void wlr_scene_rect_set_input_enabled(struct wlr_scene_rect *rect,
+	int enabled);
 
 /**
  * Add a node displaying a buffer to the scene-graph.
@@ -522,6 +613,12 @@ void wlr_scene_buffer_set_buffer_with_options(struct wlr_scene_buffer *scene_buf
  */
 void wlr_scene_buffer_set_opaque_region(struct wlr_scene_buffer *scene_buffer,
 	const pixman_region32_t *region);
+
+/**
+ * Force compositing for a buffer whose custom shader may produce transparency.
+ */
+void wlr_scene_buffer_set_force_blend(struct wlr_scene_buffer *scene_buffer,
+	int force_blend);
 
 /**
  * Set the source rectangle describing the region of the buffer which will be
@@ -595,6 +692,51 @@ void wlr_scene_output_destroy(struct wlr_scene_output *scene_output);
 void wlr_scene_output_set_position(struct wlr_scene_output *scene_output,
 	int lx, int ly);
 
+/**
+ * Set a callback which may replace ordinary scene-buffer texture draws.
+ */
+void wlr_scene_output_set_buffer_render_hook(
+	struct wlr_scene_output *scene_output,
+	wlr_scene_buffer_render_hook_func_t hook, void *data);
+
+/**
+ * Set the predicate used to disable direct scanout for affected buffers.
+ */
+void wlr_scene_output_set_buffer_needs_composition(
+	struct wlr_scene_output *scene_output,
+	wlr_scene_buffer_needs_composition_func_t predicate);
+
+/**
+ * Set a callback which may replace ordinary scene-rectangle draws.
+ */
+void wlr_scene_output_set_rect_render_hook(
+	struct wlr_scene_output *scene_output,
+	wlr_scene_rect_render_hook_func_t hook);
+
+/**
+ * Set callbacks invoked at the beginning of scene rendering and immediately
+ * before each visible scene node is rendered.
+ */
+void wlr_scene_output_set_render_hooks(
+	struct wlr_scene_output *scene_output,
+	wlr_scene_render_begin_hook_func_t begin_hook,
+	wlr_scene_node_render_hook_func_t node_hook);
+
+/**
+ * Set a callback invoked when scene content damages this output. The source is
+ * NULL when the damage cannot be attributed to one scene node.
+ */
+void wlr_scene_output_set_damage_hook(
+	struct wlr_scene_output *scene_output,
+	wlr_scene_damage_hook_func_t hook, void *data);
+
+/**
+ * Compare two nodes' scene render order. Returns -1 when the first node is
+ * below the second, 1 when it is above, and 0 when the order is indeterminate.
+ */
+int wlr_scene_node_render_order(
+	struct wlr_scene_node *first, struct wlr_scene_node *second);
+
 struct wlr_scene_output_state_options {
 	struct wlr_scene_timer *timer;
 
@@ -610,7 +752,57 @@ struct wlr_scene_output_state_options {
 	 * wlr_output_state or output size if not specified.
 	 */
 	struct wlr_swapchain *swapchain;
+
+	/**
+	 * Optional single scene-buffer candidate for promotion to an output layer.
+	 * The candidate and its embedded layer state must remain valid until the
+	 * output state is finished. The scene builder always includes the layer in
+	 * the output state, disabled when promotion is unavailable or rejected.
+	 */
+	struct wlr_scene_output_layer_candidate *layer_candidate;
 };
+
+enum wlr_scene_output_layer_rejection_reason {
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_NONE = 0,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_WRONG_NODE,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_OUTPUT_STATE,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_CAPTURE_ACTIVE,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_SOFTWARE_CURSOR,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_NO_BUFFER,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_NOT_OPAQUE,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_TRANSFORMED,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_CLIPPED,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_EFFECTS,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_COLOR,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_SCALED,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_OUTSIDE_OUTPUT,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_INTERSECTED,
+	WLR_SCENE_OUTPUT_LAYER_REJECTION_BACKEND_TEST,
+};
+
+/**
+ * Caller-owned state for one scene output-layer promotion attempt.
+ */
+struct wlr_scene_output_layer_candidate {
+	struct wlr_output_layer *layer;
+	struct wlr_scene_buffer *buffer;
+
+	// Input: whether this layer was promoted by the last successful commit.
+	bool previously_promoted;
+
+	// Output: whether this build accepted and omitted the buffer from composition.
+	bool promoted;
+	bool tested;
+
+	enum wlr_scene_output_layer_rejection_reason rejection_reason;
+	struct wlr_scene_output *scene_output;
+
+	// Internal output state. Callers must not modify this while a state is live.
+	struct wlr_output_layer_state state;
+};
+
+void wlr_scene_output_layer_candidate_finish(
+	struct wlr_scene_output_layer_candidate *candidate, bool committed);
 
 /**
  * Returns true if scene wants to render a new frame. False, if no new frame

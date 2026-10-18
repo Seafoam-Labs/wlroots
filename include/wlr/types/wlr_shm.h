@@ -50,4 +50,7 @@ struct wlr_shm *wlr_shm_create(struct wl_display *display, uint32_t version,
 struct wlr_shm *wlr_shm_create_with_renderer(struct wl_display *display,
 	uint32_t version, struct wlr_renderer *renderer);
 
+/* Borrowed until the wl_buffer resource is destroyed. Display thread only. */
+struct wlr_buffer *wlr_shm_buffer_try_from_resource(struct wl_resource *resource);
+
 #endif

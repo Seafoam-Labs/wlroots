@@ -148,6 +148,10 @@ static struct wlr_drm_fb *drm_fb_create(struct wlr_drm_backend *drm,
 		return NULL;
 	}
 
+	/* Opting into colorops disables the implicit legacy YUV conversion. */
+	if (drm->color_pipeline_enabled && pixel_format_is_ycbcr(attribs.format)) {
+		return NULL;
+	}
 	if (is_buffer_poisoned(drm, buf)) {
 		wlr_log(WLR_DEBUG, "Buffer is poisoned");
 		return NULL;

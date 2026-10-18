@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <vulkan/vulkan.h>
+#include <wlr/render/vulkan.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/render/wlr_texture.h>
 #include <wlr/render/color.h>
@@ -17,6 +18,7 @@ struct wlr_vk_descriptor_pool;
 struct wlr_vk_texture;
 
 struct wlr_vk_instance {
+	size_t refs;
 	VkInstance instance;
 	VkDebugUtilsMessengerEXT messenger;
 
@@ -34,6 +36,7 @@ void vulkan_instance_destroy(struct wlr_vk_instance *ini);
 
 // Logical vulkan device state.
 struct wlr_vk_device {
+	bool dmabuf;
 	struct wlr_vk_instance *instance;
 
 	VkPhysicalDevice phdev;
@@ -234,6 +237,11 @@ struct wlr_vk_render_buffer {
 	VkDeviceMemory memories[WLR_DMABUF_MAX_PLANES];
 	uint32_t mem_count;
 	VkImage image;
+	bool copy_target;
+	uint32_t format;
+	VkBuffer copy_staging;
+	VkDeviceMemory copy_memory;
+	void *copy_mapping;
 
 	// Framebuffer and image view for rendering directly onto the buffer image,
 	// without any color transform.
@@ -274,11 +282,13 @@ bool vulkan_setup_two_pass_framebuffer(struct wlr_vk_render_buffer *buffer,
 struct wlr_vk_command_buffer {
 	VkCommandBuffer vk;
 	bool recording;
+	bool submitted;
 	uint64_t timeline_point;
 	// Textures to destroy after the command buffer completes
 	struct wl_list destroy_textures; // wlr_vk_texture.destroy_link
 	// Staging shared buffers to release after the command buffer completes
 	struct wl_list stage_buffers; // wlr_vk_shared_buffer.link
+	struct wl_list completion_callbacks; // wlr_vk_render_completion.link
 	// Color transform to unref after the command buffer completes
 	struct wlr_color_transform *color_transform;
 
@@ -286,6 +296,12 @@ struct wlr_vk_command_buffer {
 	VkSemaphore binary_semaphore;
 
 	struct wl_array wait_semaphores; // VkSemaphore
+};
+
+struct wlr_vk_render_completion {
+	struct wl_list link;
+	wlr_vk_render_completion_func_t callback;
+	void *data;
 };
 
 #define VULKAN_COMMAND_BUFFERS_CAP 64
@@ -330,6 +346,11 @@ struct wlr_vk_renderer {
 	struct wl_list descriptor_pools; // wlr_vk_descriptor_pool.link
 	struct wl_list render_format_setups; // wlr_vk_render_format_setup.link
 
+	struct wlr_drm_format_set copy_formats;
+	bool offscreen_enabled;
+	bool sync_failed;
+	uint64_t last_submitted_point;
+	struct wlr_vk_render_pass *failed_passes;
 
 	struct wl_list textures; // wlr_vk_texture.link
 	// Textures to return to foreign queue
@@ -409,6 +430,7 @@ VkCommandBuffer vulkan_record_stage_cb(struct wlr_vk_renderer *renderer);
 bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer);
 
 struct wlr_vk_render_pass_texture {
+	struct wlr_buffer *buffer; // held until completion publication or recovery
 	struct wlr_vk_texture *texture;
 
 	struct wlr_drm_syncobj_timeline *wait_timeline;
@@ -416,6 +438,9 @@ struct wlr_vk_render_pass_texture {
 };
 
 struct wlr_vk_render_pass {
+	struct wlr_vk_render_pass *next_failed;
+	bool transition_dummy;
+	bool completion_proven;
 	struct wlr_render_pass base;
 	struct wlr_vk_renderer *renderer;
 	struct wlr_vk_render_buffer *render_buffer;
@@ -428,6 +453,8 @@ struct wlr_vk_render_pass {
 	bool failed;
 	bool two_pass; // rendering via intermediate blending buffer
 	struct wlr_color_transform *color_transform;
+	wlr_vk_render_texture_hook_func_t texture_hook;
+	void *texture_hook_data;
 
 	struct wlr_drm_syncobj_timeline *signal_timeline;
 	uint64_t signal_point;
@@ -480,8 +507,13 @@ bool vulkan_sync_foreign_texture_acquire(struct wlr_vk_texture *texture,
 bool vulkan_sync_render_buffer_acquire(struct wlr_vk_render_buffer *render_buffer,
 	int sync_file_fds[static WLR_DMABUF_MAX_PLANES]);
 
+bool vulkan_copy_buffer_init(struct wlr_vk_render_buffer *buffer, const struct wlr_dmabuf_attributes *attribs);
+void vulkan_copy_buffer_record(struct wlr_vk_render_buffer *buffer, VkCommandBuffer cb);
+bool vulkan_copy_buffer_finish(struct wlr_vk_render_pass *pass);
+bool vulkan_is_copy_buffer(struct wlr_buffer *buffer);
+
 bool vulkan_read_pixels(struct wlr_vk_renderer *vk_renderer,
-	VkFormat src_format, VkImage src_image,
+	VkFormat src_format, VkImage src_image, VkImageLayout src_layout,
 	uint32_t drm_format, uint32_t stride,
 	uint32_t width, uint32_t height, uint32_t src_x, uint32_t src_y,
 	uint32_t dst_x, uint32_t dst_y, void *data);
@@ -587,5 +619,11 @@ void vulkan_change_layout(VkCommandBuffer cb, VkImage img,
 	vulkan_strerror(res), res, ##__VA_ARGS__)
 
 #endif
+
+// Error-path recovery only. Never wait on an allocated but unsubmitted point.
+bool vulkan_cancel_render_pass(struct wlr_vk_render_pass *pass);
+bool vulkan_recover_render_pass(struct wlr_vk_render_pass *pass);
+void vulkan_fail_render_pass(struct wlr_vk_render_pass *pass);
+void vulkan_render_pass_destroy(struct wlr_vk_render_pass *pass);
 
 #endif // RENDER_VULKAN_H

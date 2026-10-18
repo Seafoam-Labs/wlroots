@@ -72,6 +72,19 @@ struct wlr_output_layer_state {
 	// to damage the whole buffer.
 	const pixman_region32_t *damage;
 
+	// When true, failing to assign this layer to a hardware plane makes the
+	// entire state invalid. Compositors use this after omitting the layer's
+	// contents from the primary buffer.
+	bool must_scan_out;
+
+	// Optional explicit synchronization for this layer's buffer. The wait
+	// point must be reached before scan-out. The signal point is reached once
+	// the backend no longer uses the buffer.
+	struct wlr_drm_syncobj_timeline *wait_timeline;
+	uint64_t wait_point;
+	struct wlr_drm_syncobj_timeline *signal_timeline;
+	uint64_t signal_point;
+
 	// Populated by the backend after wlr_output_test_state() and
 	// wlr_output_commit_state(), indicates whether the backend has acknowledged
 	// and will take care of displaying the layer

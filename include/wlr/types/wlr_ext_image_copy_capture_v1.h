@@ -4,6 +4,11 @@
  */
 #ifndef WLR_USE_UNSTABLE
 #error "Add -DWLR_USE_UNSTABLE to enable unstable wlroots features"
+/** Aqueous companion global: the compositor must apply its capture policy. */
+struct wl_global *wlr_aqueous_capture_color_manager_v1_create(struct wl_display *display);
+struct wlr_ext_image_copy_capture_frame_v1 *wlr_ext_image_copy_capture_frame_v1_from_resource(
+	struct wl_resource *resource);
+
 #endif
 
 #ifndef WLR_TYPES_WLR_EXT_IMAGE_COPY_CAPTURE_V1_H
@@ -83,5 +88,10 @@ void wlr_ext_image_copy_capture_frame_v1_fail(struct wlr_ext_image_copy_capture_
  */
 bool wlr_ext_image_copy_capture_frame_v1_copy_buffer(struct wlr_ext_image_copy_capture_frame_v1 *frame,
 	struct wlr_buffer *src, struct wlr_renderer *renderer);
+
+/** Aqueous companion global: the compositor must apply its capture policy. */
+struct wl_global *wlr_aqueous_capture_color_manager_v1_create(struct wl_display *display);
+struct wlr_ext_image_copy_capture_frame_v1 *wlr_ext_image_copy_capture_frame_v1_from_resource(
+	struct wl_resource *resource);
 
 #endif

@@ -1,16 +1,17 @@
-#include <drm_fourcc.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <wlr/render/drm_syncobj.h>
-#include <wlr/util/box.h>
-#include <wlr/util/log.h>
-#include <xf86drmMode.h>
+#include "backend/drm/color_pipeline.h"
 #include "backend/drm/drm.h"
 #include "backend/drm/fb.h"
 #include "backend/drm/iface.h"
 #include "backend/drm/util.h"
 #include "render/color.h"
+#include <drm_fourcc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <wlr/render/drm_syncobj.h>
+#include <wlr/util/box.h>
+#include <wlr/util/log.h>
+#include <xf86drmMode.h>
 
 static char *atomic_commit_flags_str(uint32_t flags) {
 	const char *const l[] = {
@@ -235,7 +236,7 @@ static bool create_hdr_output_metadata_blob(struct wlr_drm_backend *drm,
 				.y = convert_cta861_color_coord(img_desc->mastering_display_primaries.white.y),
 			},
 			.max_display_mastering_luminance = img_desc->mastering_luminance.max,
-			.min_display_mastering_luminance = img_desc->mastering_luminance.min * 0.0001,
+			.min_display_mastering_luminance = img_desc->mastering_luminance.min * 10000,
 			.max_cll = img_desc->max_cll,
 			.max_fall = img_desc->max_fall,
 		},
@@ -274,7 +275,7 @@ static uint64_t max_bpc_for_format(uint32_t format) {
 	}
 }
 
-static uint64_t pick_max_bpc(struct wlr_drm_connector *conn, struct wlr_drm_fb *fb) {
+uint64_t drm_atomic_pick_max_bpc(struct wlr_drm_connector *conn, struct wlr_drm_fb *fb) {
 	uint32_t format = DRM_FORMAT_INVALID;
 	struct wlr_dmabuf_attributes attribs = {0};
 	if (wlr_buffer_get_dmabuf(fb->wlr_buf, &attribs)) {
@@ -425,9 +426,11 @@ void drm_atomic_connector_apply_commit(struct wlr_drm_connector_state *state) {
 	}
 
 	conn->colorspace = state->colorspace;
+	drm_color_pipeline_state_finish(state, true);
 }
 
 void drm_atomic_connector_rollback_commit(struct wlr_drm_connector_state *state) {
+	drm_color_pipeline_state_finish(state, false);
 	struct wlr_drm_connector *conn = state->connector;
 	struct wlr_drm_crtc *crtc = conn->crtc;
 	struct wlr_drm_backend *drm = conn->backend;
@@ -508,7 +511,7 @@ static void atomic_connector_add(struct atomic *atom,
 			DRM_MODE_CONTENT_TYPE_GRAPHICS);
 	}
 	if (modeset && active && conn->props.max_bpc != 0 && conn->max_bpc_bounds[1] != 0) {
-		atomic_add(atom, conn->id, conn->props.max_bpc, pick_max_bpc(conn, state->primary_fb));
+		atomic_add(atom, conn->id, conn->props.max_bpc, drm_atomic_pick_max_bpc(conn, state->primary_fb));
 	}
 	if (conn->props.colorspace != 0) {
 		atomic_add(atom, conn->id, conn->props.colorspace, state->colorspace);
@@ -580,9 +583,23 @@ static bool atomic_device_commit(struct wlr_drm_backend *drm,
 
 	struct atomic atom;
 	atomic_begin(&atom);
+	// Reset every old assignment before programming any new one: planes may
+	// move between CRTCs in the same device transaction.
+	for (size_t i = 0; i < state->connectors_len; i++) {
+		if (!drm_color_pipeline_reset(&state->connectors[i], atom.req)) {
+			atom.failed = true;
+		}
+	}
 
 	for (size_t i = 0; i < state->connectors_len; i++) {
-		atomic_connector_add(&atom, &state->connectors[i], state->modeset);
+		struct wlr_drm_connector_state *s = &state->connectors[i];
+		atomic_connector_add(&atom, s, state->modeset);
+		struct wlr_drm_crtc *crtc = s->connector->crtc;
+		if (!drm_color_pipeline_add(s, atom.req, crtc->primary,
+				s->active && s->primary_fb ? s->primary_fb->wlr_buf : NULL) ||
+			(crtc->cursor && !drm_color_pipeline_add(s, atom.req, crtc->cursor, NULL))) {
+			atom.failed = true;
+		}
 	}
 
 	if (test_only) {

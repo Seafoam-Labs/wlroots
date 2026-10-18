@@ -364,6 +364,9 @@ error_alloc:
 }
 
 VkCommandBuffer vulkan_record_stage_cb(struct wlr_vk_renderer *renderer) {
+	if (renderer->sync_failed) {
+		return VK_NULL_HANDLE;
+	}
 	if (renderer->stage.cb == NULL) {
 		renderer->stage.cb = vulkan_acquire_command_buffer(renderer);
 		if (renderer->stage.cb == NULL) {
@@ -379,7 +382,10 @@ VkCommandBuffer vulkan_record_stage_cb(struct wlr_vk_renderer *renderer) {
 	return renderer->stage.cb->vk;
 }
 
-bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer) {
+static bool submit_stage(struct wlr_vk_renderer *renderer) {
+	if (renderer->sync_failed) {
+		return false;
+	}
 	if (renderer->stage.cb == NULL) {
 		return false;
 	}
@@ -408,6 +414,18 @@ bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer) {
 	VkResult res = vkQueueSubmit(renderer->dev->queue, 1, &submit_info, VK_NULL_HANDLE);
 	if (res != VK_SUCCESS) {
 		wlr_vk_error("vkQueueSubmit", res);
+		return false;
+	}
+
+	cb->submitted = true;
+	renderer->last_submitted_point = timeline_point;
+	renderer->stage.last_timeline_point = timeline_point;
+	return true;
+}
+
+bool vulkan_submit_stage_wait(struct wlr_vk_renderer *renderer) {
+	struct wlr_vk_command_buffer *cb = renderer->stage.cb;
+	if (!submit_stage(renderer)) {
 		return false;
 	}
 
@@ -449,6 +467,7 @@ static bool init_command_buffer(struct wlr_vk_command_buffer *cb,
 	};
 	wl_list_init(&cb->destroy_textures);
 	wl_list_init(&cb->stage_buffers);
+	wl_list_init(&cb->completion_callbacks);
 	return true;
 }
 
@@ -475,6 +494,14 @@ bool vulkan_wait_command_buffer(struct wlr_vk_command_buffer *cb,
 
 static void release_command_buffer_resources(struct wlr_vk_command_buffer *cb,
 		struct wlr_vk_renderer *renderer, int64_t now) {
+	struct wlr_vk_render_completion *completion, *completion_tmp;
+	wl_list_for_each_safe(completion, completion_tmp,
+			&cb->completion_callbacks, link) {
+		wl_list_remove(&completion->link);
+		completion->callback(completion->data);
+		free(completion);
+	}
+
 	struct wlr_vk_texture *texture, *texture_tmp;
 	wl_list_for_each_safe(texture, texture_tmp, &cb->destroy_textures, destroy_link) {
 		wl_list_remove(&texture->destroy_link);
@@ -561,17 +588,22 @@ static struct wlr_vk_command_buffer *get_command_buffer(
 	if (!vulkan_wait_command_buffer(wait, renderer)) {
 		return NULL;
 	}
+	release_command_buffer_resources(wait, renderer, now);
 	return wait;
 }
 
 struct wlr_vk_command_buffer *vulkan_acquire_command_buffer(
 		struct wlr_vk_renderer *renderer) {
+	if (renderer->sync_failed) {
+		return NULL;
+	}
 	struct wlr_vk_command_buffer *cb = get_command_buffer(renderer);
 	if (cb == NULL) {
 		return NULL;
 	}
 
 	assert(!cb->recording);
+	cb->submitted = false;
 	cb->recording = true;
 
 	return cb;
@@ -598,11 +630,120 @@ void vulkan_reset_command_buffer(struct wlr_vk_command_buffer *cb) {
 		return;
 	}
 
+	assert(!cb->submitted);
 	cb->recording = false;
+	cb->timeline_point = 0;
+
+	struct wlr_vk_render_completion *completion, *completion_tmp;
+	wl_list_for_each_safe(completion, completion_tmp,
+			&cb->completion_callbacks, link) {
+		wl_list_remove(&completion->link);
+		completion->callback(completion->data);
+		free(completion);
+	}
 
 	VkResult res = vkResetCommandBuffer(cb->vk, 0);
 	if (res != VK_SUCCESS) {
 		wlr_vk_error("vkResetCommandBuffer", res);
+	}
+}
+
+// Only used after an error. Healthy frames continue to publish fences without
+// blocking the compositor. Waiting on our own submitted work is not a substitute
+// for acquiring an external producer dependency.
+static bool wait_last_submission(struct wlr_vk_renderer *renderer) {
+	if (renderer->last_submitted_point == 0) {
+		return true;
+	}
+	VkSemaphoreWaitInfoKHR info = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR,
+		.semaphoreCount = 1,
+		.pSemaphores = &renderer->timeline_semaphore,
+		.pValues = &renderer->last_submitted_point,
+	};
+	VkResult res = renderer->dev->api.vkWaitSemaphoresKHR(renderer->dev->dev,
+		&info, 1000000000); // one second, never an unbounded recovery wait
+	if (res != VK_SUCCESS) {
+		wlr_vk_error("Synchronization recovery wait failed", res);
+		return false;
+	}
+	return true;
+}
+
+static bool signal_failed_pass(struct wlr_vk_render_pass *pass) {
+	// Scene sampling may already have promised this release point. All earlier
+	// submissions have completed; this pass is either cancelled or completed.
+	return pass->signal_timeline == NULL || wlr_drm_syncobj_timeline_signal(
+		pass->signal_timeline, pass->signal_point);
+}
+
+bool vulkan_cancel_render_pass(struct wlr_vk_render_pass *pass) {
+	struct wlr_vk_renderer *renderer = pass->renderer;
+	struct wlr_vk_command_buffer *cb = pass->command_buffer;
+	assert(!cb->submitted);
+
+	// Flush uploads independently, without any of the cancelled pass's image
+	// ownership barriers or draws. This preserves uploaded texture/LUT state and
+	// makes releasing this pass's references safe even after earlier GPU use.
+	if (renderer->stage.cb != NULL && !submit_stage(renderer)) {
+		return false;
+	}
+	if (!wait_last_submission(renderer) || !signal_failed_pass(pass)) {
+		return false;
+	}
+
+	struct wlr_vk_texture *texture, *tmp;
+	wl_list_for_each_safe(texture, tmp, &renderer->foreign_textures, foreign_link) {
+		texture->owned = false;
+		wl_list_remove(&texture->foreign_link);
+	}
+
+	// Discard temporary imported semaphore payloads which were never consumed.
+	VkSemaphore *sem;
+	wl_array_for_each(sem, &cb->wait_semaphores) {
+		vkDestroySemaphore(renderer->dev->dev, *sem, NULL);
+		*sem = VK_NULL_HANDLE;
+	}
+	vulkan_reset_command_buffer(cb);
+	release_command_buffer_resources(cb, renderer, get_current_time_msec());
+	return true;
+}
+
+bool vulkan_recover_render_pass(struct wlr_vk_render_pass *pass) {
+	struct wlr_vk_renderer *renderer = pass->renderer;
+	struct wlr_vk_command_buffer *cb = pass->command_buffer;
+	assert(cb->submitted);
+	if (!wait_last_submission(renderer)) {
+		return false;
+	}
+	pass->completion_proven = true;
+	if (!signal_failed_pass(pass)) {
+		return false;
+	}
+	// Failed export can leave an unconsumed binary signal. Destroy it only
+	// after completion; the next submission will allocate a fresh semaphore.
+	vkDestroySemaphore(renderer->dev->dev, cb->binary_semaphore, NULL);
+	cb->binary_semaphore = VK_NULL_HANDLE;
+	return true;
+}
+
+void vulkan_fail_render_pass(struct wlr_vk_render_pass *pass) {
+	struct wlr_vk_renderer *renderer = pass->renderer;
+	if (pass->command_buffer->submitted && !pass->completion_proven) {
+		// Returning false would let capture send "failed" and the client reuse
+		// an unfenced buffer while GPU writes may still be pending. Buffer locks
+		// only protect object lifetime, not external access. Stop the process
+		// without dispatching any more protocol events; device teardown belongs
+		// to the driver. Do not run application completion callbacks here.
+		wlr_log(WLR_ERROR, "Cannot establish GPU completion after fence publication failure; terminating to prevent unfenced buffer reuse");
+		abort();
+	}
+	pass->next_failed = renderer->failed_passes;
+	renderer->failed_passes = pass;
+	if (!renderer->sync_failed) {
+		renderer->sync_failed = true;
+		wlr_log(WLR_ERROR, "Frame synchronization unrecoverable; retaining resources and replacing renderer");
+		wl_signal_emit_mutable(&renderer->wlr_renderer.events.lost, NULL);
 	}
 }
 
@@ -637,6 +778,9 @@ static void destroy_render_buffer(struct wlr_vk_render_buffer *buffer) {
 			buffer->two_pass.blend_descriptor_set);
 	}
 
+	if (buffer->copy_mapping) vkUnmapMemory(dev, buffer->copy_memory);
+	vkDestroyBuffer(dev, buffer->copy_staging, NULL);
+	vkFreeMemory(dev, buffer->copy_memory, NULL);
 	vkDestroyImage(dev, buffer->image, NULL);
 	for (size_t i = 0u; i < buffer->mem_count; ++i) {
 		vkFreeMemory(dev, buffer->memories[i], NULL);
@@ -708,7 +852,8 @@ bool vulkan_setup_two_pass_framebuffer(struct wlr_vk_render_buffer *buffer,
 		.tiling = VK_IMAGE_TILING_OPTIMAL,
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 		.extent = (VkExtent3D) { dmabuf->width, dmabuf->height, 1 },
-		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+		.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+			VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 	};
 
 	res = vkCreateImage(dev, &img_info, NULL, &buffer->two_pass.blend_image);
@@ -912,16 +1057,31 @@ static struct wlr_vk_render_buffer *create_render_buffer(
 	wl_list_insert(&renderer->render_buffers, &buffer->link);
 
 	struct wlr_dmabuf_attributes dmabuf = {0};
-	if (!wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
+	bool copy = wlr_vk_renderer_requires_copy(&renderer->wlr_renderer) || vulkan_is_copy_buffer(wlr_buffer);
+	if (copy) {
+		void *data;
+		size_t stride;
+		if (!wlr_buffer_begin_data_ptr_access(wlr_buffer,
+				WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &dmabuf.format, &stride)) goto error;
+		wlr_buffer_end_data_ptr_access(wlr_buffer);
+		dmabuf.width = wlr_buffer->width;
+		dmabuf.height = wlr_buffer->height;
+	} else if (!wlr_buffer_get_dmabuf(wlr_buffer, &dmabuf)) {
 		goto error;
 	}
 
 	wlr_log(WLR_DEBUG, "vulkan create_render_buffer: %.4s, %dx%d",
 		(const char*) &dmabuf.format, dmabuf.width, dmabuf.height);
 
+	buffer->format = dmabuf.format;
 	bool using_mutable_srgb = false;
-	buffer->image = vulkan_import_dmabuf(renderer, &dmabuf,
-		buffer->memories, &buffer->mem_count, true, &using_mutable_srgb);
+	if (copy) {
+		if (!vulkan_copy_buffer_init(buffer, &dmabuf)) goto error;
+		using_mutable_srgb = true;
+	} else {
+		buffer->image = vulkan_import_dmabuf(renderer, &dmabuf,
+			buffer->memories, &buffer->mem_count, true, &using_mutable_srgb);
+	}
 	if (!buffer->image) {
 		goto error;
 	}
@@ -952,7 +1112,6 @@ error:
 		destroy_render_buffer(buffer);
 	}
 
-	wlr_dmabuf_attributes_finish(&dmabuf);
 	return NULL;
 }
 
@@ -989,6 +1148,10 @@ static bool buffer_export_sync_file(struct wlr_vk_renderer *renderer, struct wlr
 			if (ret < 0) {
 				wlr_log_errno(WLR_ERROR, "Failed to wait for DMA-BUF fence");
 				return false;
+			} else if (ret > 0 && (pollfd.revents & (POLLERR | POLLHUP | POLLNVAL) ||
+					!(pollfd.revents & pollfd.events))) {
+				wlr_log(WLR_ERROR, "Invalid DMA-BUF fence poll result: %#x", pollfd.revents);
+				return false;
 			} else if (ret == 0) {
 				wlr_log(WLR_ERROR, "Timed out while waiting for DMA-BUF fence");
 				return false;
@@ -1018,6 +1181,7 @@ bool vulkan_sync_foreign_texture_acquire(struct wlr_vk_texture *texture,
 
 bool vulkan_sync_render_buffer_acquire(struct wlr_vk_render_buffer *render_buffer,
 		int sync_file_fds[static WLR_DMABUF_MAX_PLANES]) {
+	if (render_buffer->copy_target) return true;
 	return buffer_export_sync_file(render_buffer->renderer, render_buffer->wlr_buffer,
 		DMA_BUF_SYNC_WRITE, sync_file_fds);
 }
@@ -1044,6 +1208,22 @@ bool vulkan_sync_render_pass_release(struct wlr_vk_renderer *renderer,
 	VkResult res;
 	struct wlr_vk_command_buffer *cb = pass->command_buffer;
 
+	if (pass->render_buffer->copy_target) {
+		// Drain the binary semaphore if submit used one, before recycling it.
+		if (renderer->dev->implicit_sync_interop || pass->signal_timeline != NULL) {
+			const VkSemaphoreGetFdInfoKHR info = {
+				.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+				.semaphore = cb->binary_semaphore,
+				.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+			};
+			int fd = -1;
+			res = renderer->dev->api.vkGetSemaphoreFdKHR(renderer->dev->dev, &info, &fd);
+			if (res != VK_SUCCESS) return false;
+			if (fd >= 0) close(fd);
+		}
+		return pass->signal_timeline == NULL ||
+			wlr_drm_syncobj_timeline_signal(pass->signal_timeline, pass->signal_point);
+	}
 	if (!renderer->dev->implicit_sync_interop && pass->signal_timeline == NULL) {
 		// We have no choice but to block here sadly
 		return vulkan_wait_command_buffer(cb, renderer);
@@ -1065,6 +1245,10 @@ bool vulkan_sync_render_pass_release(struct wlr_vk_renderer *renderer,
 		return false;
 	}
 
+	if (sync_file_fd == -1) {
+		return signal_failed_pass(pass);
+	}
+
 	bool ok = false;
 	if (pass->signal_timeline != NULL) {
 		if (!wlr_drm_syncobj_timeline_import_sync_file(pass->signal_timeline,
@@ -1078,7 +1262,10 @@ bool vulkan_sync_render_pass_release(struct wlr_vk_renderer *renderer,
 
 		struct wlr_vk_render_pass_texture *pass_texture;
 		wl_array_for_each(pass_texture, &pass->textures) {
-			if (!buffer_import_sync_file(pass_texture->texture->buffer, DMA_BUF_SYNC_READ, sync_file_fd)) {
+			if (pass_texture->buffer == NULL) {
+				continue;
+			}
+			if (!buffer_import_sync_file(pass_texture->buffer, DMA_BUF_SYNC_READ, sync_file_fd)) {
 				goto out;
 			}
 		}
@@ -1095,7 +1282,7 @@ static const struct wlr_drm_format_set *vulkan_get_texture_formats(
 		struct wlr_renderer *wlr_renderer, uint32_t buffer_caps) {
 	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
 	if (buffer_caps & WLR_BUFFER_CAP_DMABUF) {
-		return &renderer->dev->dmabuf_texture_formats;
+		return renderer->dev->dmabuf ? &renderer->dev->dmabuf_texture_formats : NULL;
 	} else if (buffer_caps & WLR_BUFFER_CAP_DATA_PTR) {
 		return &renderer->dev->shm_texture_formats;
 	} else {
@@ -1106,12 +1293,14 @@ static const struct wlr_drm_format_set *vulkan_get_texture_formats(
 static const struct wlr_drm_format_set *vulkan_get_render_formats(
 		struct wlr_renderer *wlr_renderer) {
 	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
-	return &renderer->dev->dmabuf_render_formats;
+	return !wlr_vk_renderer_requires_copy(wlr_renderer) ? &renderer->dev->dmabuf_render_formats :
+		wlr_vk_renderer_get_copy_formats(wlr_renderer);
 }
 
 static void vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
 	struct wlr_vk_device *dev = renderer->dev;
+	wlr_drm_format_set_finish(&renderer->copy_formats);
 	if (!dev) {
 		free(renderer);
 		return;
@@ -1120,6 +1309,22 @@ static void vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 	VkResult res = vkDeviceWaitIdle(renderer->dev->dev);
 	if (res != VK_SUCCESS) {
 		wlr_vk_error("vkDeviceWaitIdle", res);
+		if (res != VK_ERROR_DEVICE_LOST) {
+			// Do not return to application teardown with live GPU work: it may
+			// free resources referenced by our completion callbacks.
+			abort();
+		}
+	}
+
+	while (renderer->failed_passes != NULL) {
+		struct wlr_vk_render_pass *pass = renderer->failed_passes;
+		renderer->failed_passes = pass->next_failed;
+		struct wlr_buffer *buffer = pass->render_buffer->wlr_buffer;
+		if (!signal_failed_pass(pass)) {
+			wlr_log(WLR_ERROR, "Failed to resolve release point during renderer teardown");
+		}
+		vulkan_render_pass_destroy(pass);
+		wlr_buffer_unlock(buffer);
 	}
 
 	for (size_t i = 0; i < VULKAN_COMMAND_BUFFERS_CAP; i++) {
@@ -1215,7 +1420,7 @@ static void vulkan_destroy(struct wlr_renderer *wlr_renderer) {
 }
 
 bool vulkan_read_pixels(struct wlr_vk_renderer *vk_renderer,
-		VkFormat src_format, VkImage src_image,
+		VkFormat src_format, VkImage src_image, VkImageLayout src_layout,
 		uint32_t drm_format, uint32_t stride,
 		uint32_t width, uint32_t height, uint32_t src_x, uint32_t src_y,
 		uint32_t dst_x, uint32_t dst_y, void *data) {
@@ -1336,9 +1541,9 @@ bool vulkan_read_pixels(struct wlr_vk_renderer *vk_renderer,
 			VK_PIPELINE_STAGE_TRANSFER_BIT,
 			VK_ACCESS_TRANSFER_WRITE_BIT);
 	vulkan_change_layout(cb, src_image,
-			VK_IMAGE_LAYOUT_GENERAL,
-			VK_PIPELINE_STAGE_TRANSFER_BIT,
-			VK_ACCESS_MEMORY_READ_BIT,
+			src_layout,
+			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
 			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			VK_PIPELINE_STAGE_TRANSFER_BIT,
 			VK_ACCESS_TRANSFER_READ_BIT);
@@ -1394,14 +1599,14 @@ bool vulkan_read_pixels(struct wlr_vk_renderer *vk_renderer,
 			VK_PIPELINE_STAGE_TRANSFER_BIT,
 			VK_ACCESS_TRANSFER_WRITE_BIT,
 			VK_IMAGE_LAYOUT_GENERAL,
-			VK_PIPELINE_STAGE_TRANSFER_BIT,
-			0);
+			VK_PIPELINE_STAGE_HOST_BIT,
+			VK_ACCESS_HOST_READ_BIT);
 	vulkan_change_layout(cb, src_image,
 			VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			VK_PIPELINE_STAGE_TRANSFER_BIT,
 			VK_ACCESS_TRANSFER_READ_BIT,
-			VK_IMAGE_LAYOUT_GENERAL,
-			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			src_layout,
+			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 			VK_ACCESS_MEMORY_READ_BIT);
 
 	if (!vulkan_submit_stage_wait(vk_renderer)) {
@@ -1468,6 +1673,9 @@ static int vulkan_get_drm_fd(struct wlr_renderer *wlr_renderer) {
 static struct wlr_render_pass *vulkan_begin_buffer_pass(struct wlr_renderer *wlr_renderer,
 		struct wlr_buffer *buffer, const struct wlr_buffer_pass_options *options) {
 	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
+	if (renderer->sync_failed) {
+		return NULL;
+	}
 
 	struct wlr_vk_render_buffer *render_buffer = get_render_buffer(renderer, buffer);
 	if (!render_buffer) {
@@ -2524,11 +2732,15 @@ struct wlr_renderer *vulkan_renderer_create_for_device(struct wlr_vk_device *dev
 	VkResult res;
 	if (!(renderer = calloc(1, sizeof(*renderer)))) {
 		wlr_log_errno(WLR_ERROR, "failed to allocate wlr_vk_renderer");
+		struct wlr_vk_instance *ini = dev->instance;
+		vulkan_device_destroy(dev);
+		vulkan_instance_destroy(ini);
 		return NULL;
 	}
 
 	renderer->dev = dev;
-	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl, WLR_BUFFER_CAP_DMABUF);
+	wlr_renderer_init(&renderer->wlr_renderer, &renderer_impl,
+		(dev->dmabuf ? WLR_BUFFER_CAP_DMABUF : 0) | WLR_BUFFER_CAP_DATA_PTR);
 	renderer->wlr_renderer.features.input_color_transform = true;
 	renderer->wlr_renderer.features.output_color_transform = true;
 	wl_list_init(&renderer->stage.buffers);
@@ -2629,6 +2841,21 @@ error:
 VkInstance wlr_vk_renderer_get_instance(struct wlr_renderer *renderer) {
 	struct wlr_vk_renderer *vk_renderer = vulkan_get_renderer(renderer);
 	return vk_renderer->dev->instance->instance;
+}
+
+struct wlr_renderer *wlr_vk_renderer_recreate(struct wlr_renderer *renderer) {
+	struct wlr_vk_device *old = vulkan_get_renderer(renderer)->dev;
+	struct wlr_vk_device *dev = vulkan_device_create(old->instance, old->phdev);
+	if (!dev) {
+		return NULL;
+	}
+	dev->drm_fd = vulkan_open_phdev_drm_fd(old->phdev);
+	old->instance->refs++;
+	struct wlr_renderer *replacement = vulkan_renderer_create_for_device(dev);
+	if (replacement) {
+		replacement->features.timeline &= renderer->features.timeline;
+	}
+	return replacement;
 }
 
 VkPhysicalDevice wlr_vk_renderer_get_physical_device(struct wlr_renderer *renderer) {

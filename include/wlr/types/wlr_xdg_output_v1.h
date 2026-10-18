@@ -48,4 +48,8 @@ struct wlr_xdg_output_manager_v1 {
 struct wlr_xdg_output_manager_v1 *wlr_xdg_output_manager_v1_create(
 	struct wl_display *display, struct wlr_output_layout *layout);
 
+/** Refresh changed client-specific geometry; logical clients use layout events. */
+void wlr_xdg_output_manager_v1_update(
+	struct wlr_xdg_output_manager_v1 *manager);
+
 #endif

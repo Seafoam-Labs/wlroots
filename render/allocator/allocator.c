@@ -199,3 +199,21 @@ struct wlr_buffer *wlr_allocator_create_buffer(struct wlr_allocator *alloc,
 	}
 	return buffer;
 }
+
+struct wlr_allocator *allocator_autocreate_cpu(struct wlr_backend *backend);
+
+// Create a CPU-writable display allocation without requesting GPU render usage.
+struct wlr_allocator *allocator_autocreate_cpu(struct wlr_backend *backend) {
+	int fd = wlr_backend_get_drm_fd(backend);
+	if (fd >= 0 && (backend->buffer_caps & WLR_BUFFER_CAP_DMABUF)) {
+		int reopened = reopen_drm_node(fd, false);
+		if (reopened < 0) return NULL;
+		struct wlr_allocator *alloc = wlr_drm_dumb_allocator_create(reopened);
+		if (!alloc) close(reopened);
+		return alloc;
+	}
+	if (backend->buffer_caps & (WLR_BUFFER_CAP_SHM | WLR_BUFFER_CAP_DATA_PTR)) {
+		return wlr_shm_allocator_create();
+	}
+	return NULL;
+}

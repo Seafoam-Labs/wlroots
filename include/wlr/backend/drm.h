@@ -41,6 +41,8 @@ struct wlr_backend *wlr_drm_backend_create(struct wlr_session *session,
 
 bool wlr_backend_is_drm(struct wlr_backend *backend);
 bool wlr_output_is_drm(struct wlr_output *output);
+/** Negotiated capability; false for nested, legacy and multi-GPU outputs. */
+bool wlr_drm_output_supports_color_pipeline(struct wlr_output *output);
 
 /**
  * Get the parent DRM backend, if any.

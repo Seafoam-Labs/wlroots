@@ -1,4 +1,6 @@
 #include <assert.h>
+#include "types/wlr_commit_timing_v1.h"
+#include <wlr/types/wlr_fifo_v1.h>
 #include <stdlib.h>
 #include <wayland-server-core.h>
 #include <wlr/types/wlr_compositor.h>
@@ -25,6 +27,7 @@ static bool subsurface_is_synchronized(struct wlr_subsurface *subsurface) {
 static const struct wl_subsurface_interface subsurface_implementation;
 
 static void subsurface_destroy(struct wlr_subsurface *subsurface) {
+	commit_timing_detach(subsurface->surface);
 	if (subsurface->has_cache) {
 		wlr_surface_unlock_cached(subsurface->surface, subsurface->cached_seq);
 	}
@@ -152,6 +155,22 @@ static void subsurface_handle_place_below(struct wl_client *client,
 	wl_list_insert(node->prev, &subsurface->pending.link);
 }
 
+static void fifo_changed(struct wlr_surface *surface) {
+	wlr_fifo_v1_surface_changed(surface);
+	struct wlr_subsurface *sub = wlr_subsurface_try_from_wlr_surface(surface);
+	if (sub && !subsurface_is_synchronized(sub)) commit_timing_detach(surface);
+	commit_timing_changed(surface);
+	// Include unmapped and not-yet-parent-committed descendants: their effective
+	// synchronization mode changes too, even if they have no scene node yet.
+	struct wlr_subsurface *child;
+	wl_list_for_each(child, &surface->pending.subsurfaces_below, pending.link) {
+		fifo_changed(child->surface);
+	}
+	wl_list_for_each(child, &surface->pending.subsurfaces_above, pending.link) {
+		fifo_changed(child->surface);
+	}
+}
+
 static void subsurface_handle_set_sync(struct wl_client *client,
 		struct wl_resource *resource) {
 	struct wlr_subsurface *subsurface = subsurface_from_resource(resource);
@@ -160,6 +179,7 @@ static void subsurface_handle_set_sync(struct wl_client *client,
 	}
 
 	subsurface->synchronized = true;
+	fifo_changed(subsurface->surface);
 }
 
 static void subsurface_handle_set_desync(struct wl_client *client,
@@ -171,6 +191,7 @@ static void subsurface_handle_set_desync(struct wl_client *client,
 
 	if (subsurface->synchronized) {
 		subsurface->synchronized = false;
+		fifo_changed(subsurface->surface);
 
 		if (!subsurface_is_synchronized(subsurface) &&
 				subsurface->has_cache) {
@@ -279,8 +300,9 @@ static void subsurface_handle_surface_client_commit(
 	}
 }
 
-void subsurface_handle_parent_commit(struct wlr_subsurface *subsurface) {
-	if (subsurface->synchronized && subsurface->has_cache) {
+void subsurface_handle_parent_commit(struct wlr_subsurface *subsurface, bool managed) {
+	if (!managed &&
+			subsurface->synchronized && subsurface->has_cache) {
 		wlr_surface_unlock_cached(subsurface->surface, subsurface->cached_seq);
 		subsurface->has_cache = false;
 	}

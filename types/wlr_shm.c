@@ -583,3 +583,10 @@ static bool shm_has_format(struct wlr_shm *shm, uint32_t shm_format) {
 	}
 	return false;
 }
+
+struct wlr_buffer *wlr_shm_buffer_try_from_resource(struct wl_resource *resource) {
+    if (!buffer_resource_is_instance(resource)) {
+        return NULL;
+    }
+    return buffer_base_from_resource(resource);
+}

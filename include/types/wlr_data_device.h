@@ -13,6 +13,7 @@ struct wlr_client_data_source {
 	struct wlr_data_source_impl impl;
 	struct wl_resource *resource;
 	bool finalized;
+	bool toplevel_drag_used;
 };
 
 extern const struct wlr_surface_role drag_icon_surface_role;
@@ -27,6 +28,8 @@ struct wlr_client_data_source *client_data_source_create(
 	struct wl_list *resource_list);
 struct wlr_client_data_source *client_data_source_from_resource(
 	struct wl_resource *resource);
+bool xdg_toplevel_drag_check_selection(struct wlr_client_data_source *source, struct wl_resource *device);
+void xdg_toplevel_drag_start(struct wlr_drag *drag);
 void data_source_notify_finish(struct wlr_data_source *source);
 
 struct wlr_seat_client *seat_client_from_data_device_resource(

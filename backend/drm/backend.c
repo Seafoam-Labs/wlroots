@@ -33,6 +33,12 @@ static void backend_destroy(struct wlr_backend *backend) {
 
 	struct wlr_drm_backend *drm = get_drm_backend_from_backend(backend);
 
+	drm->destroying = true;
+	if (drm->lease_rescan != NULL) {
+		wl_event_source_remove(drm->lease_rescan);
+		drm->lease_rescan = NULL;
+	}
+
 	struct wlr_drm_connector *conn, *next;
 	wl_list_for_each_safe(conn, next, &drm->connectors, link) {
 		conn->crtc = NULL; // leave CRTCs on when shutting down

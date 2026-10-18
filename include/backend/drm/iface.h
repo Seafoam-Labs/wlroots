@@ -34,6 +34,7 @@ bool drm_legacy_crtc_set_gamma(struct wlr_drm_backend *drm,
 bool create_fb_damage_clips_blob(struct wlr_drm_backend *drm,
 	int width, int height, const pixman_region32_t *damage, uint32_t *blob_id);
 bool drm_atomic_reset(struct wlr_drm_backend *drm);
+uint64_t drm_atomic_pick_max_bpc(struct wlr_drm_connector *conn, struct wlr_drm_fb *fb);
 
 bool drm_atomic_connector_prepare(struct wlr_drm_connector_state *state,
 	bool modeset);

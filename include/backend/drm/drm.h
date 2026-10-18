@@ -20,7 +20,10 @@ struct wlr_drm_viewport {
 	struct wlr_box dst_box;
 };
 
+struct color_plane;
+
 struct wlr_drm_plane {
+	struct color_plane *color_pipeline;
 	uint32_t type;
 	uint32_t id;
 
@@ -58,10 +61,15 @@ struct wlr_drm_layer {
 
 	/* Buffer to be submitted to the kernel on the next page-flip */
 	struct wlr_drm_fb *pending_fb;
+	int pending_in_fence_fd;
 	/* Buffer submitted to the kernel, will be presented on next vblank */
 	struct wlr_drm_fb *queued_fb;
+	struct wlr_drm_syncobj_timeline *queued_release_timeline;
+	uint64_t queued_release_point;
 	/* Buffer currently displayed on screen */
 	struct wlr_drm_fb *current_fb;
+	struct wlr_drm_syncobj_timeline *current_release_timeline;
+	uint64_t current_release_point;
 
 	// One entry per wlr_drm_backend.planes
 	bool *candidate_planes;
@@ -94,6 +102,8 @@ struct wlr_drm_backend {
 	struct wlr_drm_backend *parent;
 	const struct wlr_drm_interface *iface;
 	bool addfb2_modifiers;
+	bool color_pipeline_enabled;
+	bool liftoff_fallback_allowed; // Only until the first real KMS commit
 
 	int fd;
 	char *name;
@@ -107,6 +117,8 @@ struct wlr_drm_backend {
 	struct wlr_drm_plane *planes;
 
 	struct wl_event_source *drm_event;
+	struct wl_event_source *lease_rescan;
+	bool destroying;
 
 	struct wl_listener session_destroy;
 	struct wl_listener session_active;
@@ -156,6 +168,8 @@ struct wlr_drm_connector_state {
 	struct wlr_drm_syncobj_timeline *wait_timeline;
 	uint64_t wait_point;
 
+	struct wl_array color_pipeline_state;
+
 	// used by atomic
 	uint32_t mode_id;
 	uint32_t gamma_lut;
@@ -200,6 +214,7 @@ struct wlr_drm_connector {
 	uint32_t id;
 	uint64_t max_bpc_bounds[2];
 	struct wlr_drm_lease *lease;
+	bool lease_pending;
 
 	struct wlr_drm_crtc *crtc;
 	uint32_t possible_crtcs;

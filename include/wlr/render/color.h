@@ -184,4 +184,9 @@ void wlr_color_primaries_transform_absolute_colorimetric(
 	const struct wlr_color_primaries *source,
 	const struct wlr_color_primaries *destination, float matrix[static 9]);
 
+#define WLR_AQUEOUS_COLOR_PIPELINE_VERSION 1
+struct wlr_buffer;
+/** Whether a buffer carries an immutable pre-blend hardware color recipe. */
+bool wlr_buffer_has_color_pipeline(struct wlr_buffer *buffer);
+
 #endif

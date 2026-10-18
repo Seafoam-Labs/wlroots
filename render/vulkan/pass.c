@@ -5,6 +5,7 @@
 #include <wlr/util/log.h>
 #include <wlr/render/color.h>
 #include <wlr/render/drm_syncobj.h>
+#include <wlr/render/vulkan.h>
 
 #include "render/color.h"
 #include "render/vulkan.h"
@@ -17,6 +18,135 @@ static struct wlr_vk_render_pass *get_render_pass(struct wlr_render_pass *wlr_pa
 	assert(wlr_pass->impl == &render_pass_impl);
 	struct wlr_vk_render_pass *pass = wl_container_of(wlr_pass, pass, base);
 	return pass;
+}
+
+bool wlr_vk_render_pass_get_attribs(struct wlr_render_pass *wlr_pass,
+		struct wlr_vk_render_pass_attribs *attribs) {
+	if (wlr_pass == NULL || attribs == NULL ||
+			wlr_pass->impl != &render_pass_impl) {
+		return false;
+	}
+
+	struct wlr_vk_render_pass *pass = get_render_pass(wlr_pass);
+	struct wlr_buffer *buffer = pass->render_buffer->wlr_buffer;
+	pass->bound_pipeline = VK_NULL_HANDLE;
+	*attribs = (struct wlr_vk_render_pass_attribs){
+		.command_buffer = pass->command_buffer->vk,
+		.render_pass = pass->render_setup->render_pass,
+		.extent = {
+			.width = buffer->width,
+			.height = buffer->height,
+		},
+		.subpass = 0,
+		.has_signal_timeline = pass->signal_timeline != NULL,
+	};
+	return true;
+}
+
+bool wlr_vk_render_pass_set_texture_hook(struct wlr_render_pass *wlr_pass,
+		wlr_vk_render_texture_hook_func_t hook, void *data) {
+	if (wlr_pass == NULL || wlr_pass->impl != &render_pass_impl) {
+		return false;
+	}
+
+	struct wlr_vk_render_pass *pass = get_render_pass(wlr_pass);
+	pass->texture_hook = hook;
+	pass->texture_hook_data = data;
+	return true;
+}
+
+bool wlr_vk_renderer_enable_offscreen(struct wlr_renderer *wlr_renderer) {
+	if (!wlr_renderer_is_vk(wlr_renderer)) {
+		return false;
+	}
+
+	struct wlr_vk_renderer *renderer = vulkan_get_renderer(wlr_renderer);
+	renderer->offscreen_enabled = true;
+	return true;
+}
+
+bool wlr_vk_render_pass_run_offscreen(struct wlr_render_pass *wlr_pass,
+		wlr_vk_render_offscreen_func_t callback, void *data) {
+	if (wlr_pass == NULL || callback == NULL ||
+			wlr_pass->impl != &render_pass_impl) {
+		return false;
+	}
+
+	struct wlr_vk_render_pass *pass = get_render_pass(wlr_pass);
+	if (!pass->two_pass) {
+		return false;
+	}
+
+	VkCommandBuffer cb = pass->command_buffer->vk;
+	vkCmdNextSubpass(cb, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdEndRenderPass(cb);
+	pass->bound_pipeline = VK_NULL_HANDLE;
+
+	struct wlr_buffer *buffer = pass->render_buffer->wlr_buffer;
+	struct wlr_vk_render_offscreen_attribs attribs = {
+		.command_buffer = cb,
+		.source_image_view = pass->render_buffer->two_pass.blend_image_view,
+		.source_format = VK_FORMAT_R16G16B16A16_SFLOAT,
+		.extent = {
+			.width = buffer->width,
+			.height = buffer->height,
+		},
+	};
+	bool result = callback(&attribs, data);
+
+	VkImageMemoryBarrier barrier = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+			VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = pass->render_buffer->two_pass.blend_image,
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.levelCount = 1,
+			.layerCount = 1,
+		},
+	};
+	vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		0, 0, NULL, 0, NULL, 1, &barrier);
+
+	VkRenderPassBeginInfo begin_info = {
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		.renderPass = pass->render_setup->render_pass,
+		.framebuffer = pass->render_buffer_out->framebuffer,
+		.renderArea.extent = attribs.extent,
+	};
+	vkCmdBeginRenderPass(cb, &begin_info, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdSetViewport(cb, 0, 1, &(VkViewport){
+		.width = attribs.extent.width,
+		.height = attribs.extent.height,
+		.maxDepth = 1,
+	});
+	return result;
+}
+
+bool wlr_vk_render_pass_add_completion(struct wlr_render_pass *wlr_pass,
+		wlr_vk_render_completion_func_t callback, void *data) {
+	if (wlr_pass == NULL || callback == NULL ||
+			wlr_pass->impl != &render_pass_impl) {
+		return false;
+	}
+
+	struct wlr_vk_render_completion *completion = calloc(1, sizeof(*completion));
+	if (completion == NULL) {
+		return false;
+	}
+	completion->callback = callback;
+	completion->data = data;
+
+	struct wlr_vk_render_pass *pass = get_render_pass(wlr_pass);
+	wl_list_insert(pass->command_buffer->completion_callbacks.prev,
+		&completion->link);
+	return true;
 }
 
 static struct wlr_vk_color_transform *get_color_transform(
@@ -86,10 +216,11 @@ static void encode_color_matrix(const float mat3[9], float mat4[4][4]) {
 	memcpy(mat4, result, sizeof(result));
 }
 
-static void render_pass_destroy(struct wlr_vk_render_pass *pass) {
+void vulkan_render_pass_destroy(struct wlr_vk_render_pass *pass) {
 	struct wlr_vk_render_pass_texture *pass_texture;
 	wl_array_for_each(pass_texture, &pass->textures) {
 		wlr_drm_syncobj_timeline_unref(pass_texture->wait_timeline);
+		wlr_buffer_unlock(pass_texture->buffer);
 	}
 
 	wlr_color_transform_unref(pass->color_transform);
@@ -146,6 +277,14 @@ static VkSemaphore render_pass_wait_sync_file(struct wlr_vk_render_pass *pass,
 	return *sem_ptr;
 }
 
+static void close_sync_files(int fds[static WLR_DMABUF_MAX_PLANES]) {
+	for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
+		if (fds[i] >= 0) {
+			close(fds[i]);
+		}
+	}
+}
+
 static bool render_pass_wait_render_buffer(struct wlr_vk_render_pass *pass,
 		VkSemaphoreSubmitInfoKHR *render_wait, uint32_t *render_wait_len_ptr) {
 	int sync_file_fds[WLR_DMABUF_MAX_PLANES];
@@ -154,6 +293,7 @@ static bool render_pass_wait_render_buffer(struct wlr_vk_render_pass *pass,
 	}
 
 	if (!vulkan_sync_render_buffer_acquire(pass->render_buffer, sync_file_fds)) {
+		close_sync_files(sync_file_fds);
 		return false;
 	}
 
@@ -164,9 +304,10 @@ static bool render_pass_wait_render_buffer(struct wlr_vk_render_pass *pass,
 
 		VkSemaphore sem = render_pass_wait_sync_file(pass, *render_wait_len_ptr, sync_file_fds[i]);
 		if (sem == VK_NULL_HANDLE) {
-			close(sync_file_fds[i]);
-			continue;
+			close_sync_files(sync_file_fds);
+			return false;
 		}
+		sync_file_fds[i] = -1; // ownership transferred to Vulkan
 
 		render_wait[*render_wait_len_ptr] = (VkSemaphoreSubmitInfoKHR){
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR,
@@ -177,6 +318,65 @@ static bool render_pass_wait_render_buffer(struct wlr_vk_render_pass *pass,
 		(*render_wait_len_ptr)++;
 	}
 
+	return true;
+}
+
+static bool render_pass_wait_textures(struct wlr_vk_render_pass *pass,
+		VkSemaphoreSubmitInfoKHR *render_wait, uint32_t *render_wait_len_ptr) {
+	uint32_t render_wait_len = *render_wait_len_ptr;
+	struct wlr_vk_render_pass_texture *pass_texture;
+	wl_array_for_each(pass_texture, &pass->textures) {
+		int sync_file_fds[WLR_DMABUF_MAX_PLANES];
+		for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
+			sync_file_fds[i] = -1;
+		}
+
+		if (pass_texture->wait_timeline) {
+			int sync_file_fd = wlr_drm_syncobj_timeline_export_sync_file(pass_texture->wait_timeline, pass_texture->wait_point);
+			if (sync_file_fd < 0) {
+				wlr_log(WLR_ERROR, "Failed to export wait timeline point as sync_file");
+				close_sync_files(sync_file_fds);
+				return false;
+			}
+
+			sync_file_fds[0] = sync_file_fd;
+		} else {
+			struct wlr_vk_texture *texture = pass_texture->texture;
+			if (!vulkan_sync_foreign_texture_acquire(texture, sync_file_fds)) {
+				wlr_log(WLR_ERROR, "Failed to wait for foreign texture DMA-BUF fence");
+				close_sync_files(sync_file_fds);
+				return false;
+			}
+		}
+
+		for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
+			if (sync_file_fds[i] < 0) {
+				continue;
+			}
+
+			VkSemaphore sem = render_pass_wait_sync_file(pass, render_wait_len, sync_file_fds[i]);
+			if (sem == VK_NULL_HANDLE) {
+				close_sync_files(sync_file_fds);
+				return false;
+			}
+
+			sync_file_fds[i] = -1; // ownership transferred to Vulkan
+
+			render_wait[render_wait_len] = (VkSemaphoreSubmitInfoKHR){
+				.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR,
+				.semaphore = sem,
+				.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
+			};
+
+			render_wait_len++;
+		}
+	}
+
+	if (!render_pass_wait_render_buffer(pass, render_wait, &render_wait_len)) {
+		wlr_log(WLR_ERROR, "Failed to wait for render buffer DMA-BUF fence");
+		return false;
+	}
+	*render_wait_len_ptr = render_wait_len;
 	return true;
 }
 
@@ -227,9 +427,21 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 	struct wlr_vk_render_buffer *render_buffer = pass->render_buffer;
 	struct wlr_vk_command_buffer *stage_cb = NULL;
 	VkSemaphoreSubmitInfoKHR *render_wait = NULL;
-	bool device_lost = false;
 
-	if (pass->failed) {
+	if (pass->failed || renderer->sync_failed) {
+		goto error;
+	}
+
+	size_t pass_textures_len = pass->textures.size / sizeof(struct wlr_vk_render_pass_texture);
+	size_t render_wait_cap = (1 + pass_textures_len) * WLR_DMABUF_MAX_PLANES + 1;
+	render_wait = calloc(render_wait_cap, sizeof(*render_wait));
+	if (render_wait == NULL) {
+		wlr_log_errno(WLR_ERROR, "Allocation failed");
+		goto error;
+	}
+
+	uint32_t render_wait_len = 0;
+	if (!render_pass_wait_textures(pass, render_wait, &render_wait_len)) {
 		goto error;
 	}
 
@@ -341,14 +553,6 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 
 	vkCmdEndRenderPass(render_cb->vk);
 
-	size_t pass_textures_len = pass->textures.size / sizeof(struct wlr_vk_render_pass_texture);
-	size_t render_wait_cap = (1 + pass_textures_len) * WLR_DMABUF_MAX_PLANES;
-	render_wait = calloc(render_wait_cap, sizeof(*render_wait));
-	if (render_wait == NULL) {
-		wlr_log_errno(WLR_ERROR, "Allocation failed");
-		goto error;
-	}
-
 	uint32_t barrier_count = wl_list_length(&renderer->foreign_textures) + 1;
 	VkImageMemoryBarrier *acquire_barriers = calloc(barrier_count, sizeof(*acquire_barriers));
 	VkImageMemoryBarrier *release_barriers = calloc(barrier_count, sizeof(*release_barriers));
@@ -362,10 +566,6 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 	struct wlr_vk_texture *texture, *tmp_tex;
 	size_t idx = 0;
 	wl_list_for_each_safe(texture, tmp_tex, &renderer->foreign_textures, foreign_link) {
-		if (!texture->transitioned) {
-			texture->transitioned = true;
-		}
-
 		// acquire
 		acquire_barriers[idx] = (VkImageMemoryBarrier){
 			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -397,65 +597,12 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		};
 
 		++idx;
-
-		wl_list_remove(&texture->foreign_link);
-		texture->owned = false;
-	}
-
-	uint32_t render_wait_len = 0;
-	struct wlr_vk_render_pass_texture *pass_texture;
-	wl_array_for_each(pass_texture, &pass->textures) {
-		int sync_file_fds[WLR_DMABUF_MAX_PLANES];
-		for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
-			sync_file_fds[i] = -1;
-		}
-
-		if (pass_texture->wait_timeline) {
-			int sync_file_fd = wlr_drm_syncobj_timeline_export_sync_file(pass_texture->wait_timeline, pass_texture->wait_point);
-			if (sync_file_fd < 0) {
-				wlr_log(WLR_ERROR, "Failed to export wait timeline point as sync_file");
-				continue;
-			}
-
-			sync_file_fds[0] = sync_file_fd;
-		} else {
-			struct wlr_vk_texture *texture = pass_texture->texture;
-			if (!vulkan_sync_foreign_texture_acquire(texture, sync_file_fds)) {
-				wlr_log(WLR_ERROR, "Failed to wait for foreign texture DMA-BUF fence");
-				continue;
-			}
-		}
-
-		for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
-			if (sync_file_fds[i] < 0) {
-				continue;
-			}
-
-			VkSemaphore sem = render_pass_wait_sync_file(pass, render_wait_len, sync_file_fds[i]);
-			if (sem == VK_NULL_HANDLE) {
-				close(sync_file_fds[i]);
-				continue;
-			}
-
-			render_wait[render_wait_len] = (VkSemaphoreSubmitInfoKHR){
-				.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR,
-				.semaphore = sem,
-				.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
-			};
-
-			render_wait_len++;
-		}
-	}
-
-	if (!render_pass_wait_render_buffer(pass, render_wait, &render_wait_len)) {
-		wlr_log(WLR_ERROR, "Failed to wait for render buffer DMA-BUF fence");
 	}
 
 	// also add acquire/release barriers for the current render buffer
 	VkImageLayout src_layout = VK_IMAGE_LAYOUT_GENERAL;
 	if (!pass->render_buffer_out->transitioned) {
-		src_layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
-		pass->render_buffer_out->transitioned = true;
+		src_layout = render_buffer->copy_target ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_PREINITIALIZED;
 	}
 
 	if (pass->two_pass) {
@@ -465,7 +612,6 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		VkImageLayout blend_src_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 		if (!render_buffer->two_pass.blend_transitioned) {
 			blend_src_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-			render_buffer->two_pass.blend_transitioned = true;
 		}
 
 		VkImageMemoryBarrier blend_acq_barrier = {
@@ -520,6 +666,12 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		.subresourceRange.levelCount = 1,
 	};
 
+	if (render_buffer->copy_target) {
+		acquire_barriers[idx].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		acquire_barriers[idx].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		release_barriers[idx].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		release_barriers[idx].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	}
 	++idx;
 
 	vkCmdPipelineBarrier(stage_cb->vk, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -530,6 +682,7 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL,
 		barrier_count, release_barriers);
 
+	if (render_buffer->copy_target) vulkan_copy_buffer_record(render_buffer, render_cb->vk);
 	free(acquire_barriers);
 	free(release_barriers);
 
@@ -550,6 +703,7 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR,
 		.semaphore = renderer->timeline_semaphore,
 		.value = stage_timeline_point,
+		.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
 	};
 	VkSubmitInfo2KHR stage_submit = {
 		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2_KHR,
@@ -559,20 +713,18 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		.pSignalSemaphoreInfos = &stage_signal,
 	};
 
-	VkSemaphoreSubmitInfoKHR stage_wait;
 	if (renderer->stage.last_timeline_point > 0) {
-		stage_wait = (VkSemaphoreSubmitInfoKHR){
+		render_wait[render_wait_len++] = (VkSemaphoreSubmitInfoKHR){
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR,
 			.semaphore = renderer->timeline_semaphore,
 			.value = renderer->stage.last_timeline_point,
 			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
 		};
-
-		stage_submit.waitSemaphoreInfoCount = 1;
-		stage_submit.pWaitSemaphoreInfos = &stage_wait;
 	}
-
-	renderer->stage.last_timeline_point = stage_timeline_point;
+	// Ownership transfers and layout transitions are accesses too. Wait before
+	// the stage batch containing them, not just before the later draw batch.
+	stage_submit.waitSemaphoreInfoCount = render_wait_len;
+	stage_submit.pWaitSemaphoreInfos = render_wait;
 
 	uint64_t render_timeline_point = vulkan_end_command_buffer(render_cb, renderer);
 	if (render_timeline_point == 0) {
@@ -585,6 +737,7 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR,
 		.semaphore = renderer->timeline_semaphore,
 		.value = render_timeline_point,
+		.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
 	};
 	if (renderer->dev->implicit_sync_interop || pass->signal_timeline != NULL) {
 		if (render_cb->binary_semaphore == VK_NULL_HANDLE) {
@@ -607,6 +760,7 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		render_signal[render_signal_len++] = (VkSemaphoreSubmitInfoKHR){
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO_KHR,
 			.semaphore = render_cb->binary_semaphore,
+			.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR,
 		};
 	}
 
@@ -616,8 +770,6 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 	};
 	VkSubmitInfo2KHR render_submit = {
 		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2_KHR,
-		.waitSemaphoreInfoCount = render_wait_len,
-		.pWaitSemaphoreInfos = render_wait,
 		.commandBufferInfoCount = 1,
 		.pCommandBufferInfos = &render_cb_info,
 		.signalSemaphoreInfoCount = render_signal_len,
@@ -628,9 +780,25 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 	VkResult res = renderer->dev->api.vkQueueSubmit2KHR(renderer->dev->queue, 2, submit_info, VK_NULL_HANDLE);
 
 	if (res != VK_SUCCESS) {
-		device_lost = res == VK_ERROR_DEVICE_LOST;
 		wlr_vk_error("vkQueueSubmit", res);
 		goto error;
+	}
+
+	stage_cb->submitted = true;
+	render_cb->submitted = true;
+	renderer->last_submitted_point = render_timeline_point;
+	renderer->stage.last_timeline_point = stage_timeline_point;
+	pass->render_buffer_out->transitioned = true;
+	if (pass->two_pass) {
+		render_buffer->two_pass.blend_transitioned = true;
+	}
+	if (pass->transition_dummy) {
+		renderer->dummy3d_image_transitioned = true;
+	}
+	wl_list_for_each_safe(texture, tmp_tex, &renderer->foreign_textures, foreign_link) {
+		texture->transitioned = true;
+		texture->owned = false;
+		wl_list_remove(&texture->foreign_link);
 	}
 
 	free(render_wait);
@@ -644,25 +812,36 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 		wl_list_insert(&stage_cb->stage_buffers, &stage_buf->link);
 	}
 
-	if (!vulkan_sync_render_pass_release(renderer, pass)) {
-		wlr_log(WLR_ERROR, "Failed to sync render buffer");
+	bool copied = !render_buffer->copy_target || vulkan_copy_buffer_finish(pass);
+	if (!copied && !pass->completion_proven) {
+        vulkan_fail_render_pass(pass);
+        return false;
+    }
+    bool ok = copied && vulkan_sync_render_pass_release(renderer, pass);
+	if (!ok) {
+		wlr_log(WLR_ERROR, "Render submitted, but completion fence publication failed");
+		if (!vulkan_recover_render_pass(pass)) {
+			vulkan_fail_render_pass(pass);
+			return false;
+		}
 	}
 
-	render_pass_destroy(pass);
+	vulkan_render_pass_destroy(pass);
 	wlr_buffer_unlock(render_buffer->wlr_buffer);
-	return true;
+	return ok;
 
 error:
 	free(render_wait);
-	vulkan_reset_command_buffer(stage_cb);
-	vulkan_reset_command_buffer(render_cb);
-	wlr_buffer_unlock(render_buffer->wlr_buffer);
-	render_pass_destroy(pass);
-
-	if (device_lost) {
-		wl_signal_emit_mutable(&renderer->wlr_renderer.events.lost, NULL);
+	// Before taking stage_cb, it contains only independent uploads. They must
+	// survive cancellation: textures/LUTs already reference those uploads.
+	// After taking it, it also contains this pass's ownership barriers. A
+	// recording/submission failure there requires renderer replacement.
+	if (stage_cb != NULL || renderer->sync_failed || !vulkan_cancel_render_pass(pass)) {
+		vulkan_fail_render_pass(pass);
+		return false;
 	}
-
+	vulkan_render_pass_destroy(pass);
+	wlr_buffer_unlock(render_buffer->wlr_buffer);
 	return false;
 }
 
@@ -919,16 +1098,51 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 	};
 	encode_color_matrix(color_matrix, frag_pcr_data.matrix);
 
-	bind_pipeline(pass, pipe->vk);
+	bool custom_draw = false;
+	if (pass->texture_hook != NULL) {
+		struct wlr_buffer *buffer = pass->render_buffer->wlr_buffer;
+		struct wlr_vk_render_texture_attribs attribs = {
+			.render_pass = {
+				.command_buffer = cb,
+				.render_pass = pass->render_setup->render_pass,
+				.extent = {
+					.width = buffer->width,
+					.height = buffer->height,
+				},
+				.subpass = 0,
+				.has_signal_timeline = pass->signal_timeline != NULL,
+			},
+			.pipeline_layout = pipe->layout->vk,
+			.descriptor_set_layout = view->layout->ds,
+			.descriptor_set = view->ds,
+			.alpha = frag_pcr_data.alpha,
+			.luminance_multiplier = frag_pcr_data.luminance_multiplier,
+			.texture_transform = tex_transform,
+		};
+		memcpy(attribs.projection, vert_pcr_data.mat4,
+			sizeof(attribs.projection));
+		memcpy(attribs.uv_offset, vert_pcr_data.uv_off,
+			sizeof(attribs.uv_offset));
+		memcpy(attribs.uv_size, vert_pcr_data.uv_size,
+			sizeof(attribs.uv_size));
+		memcpy(attribs.color_matrix, frag_pcr_data.matrix,
+			sizeof(attribs.color_matrix));
+		pass->bound_pipeline = VK_NULL_HANDLE;
+		custom_draw = pass->texture_hook(&attribs, pass->texture_hook_data);
+	}
 
-	vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-		pipe->layout->vk, 0, 1, &view->ds, 0, NULL);
+	if (!custom_draw) {
+		bind_pipeline(pass, pipe->vk);
 
-	vkCmdPushConstants(cb, pipe->layout->vk,
-		VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vert_pcr_data), &vert_pcr_data);
-	vkCmdPushConstants(cb, pipe->layout->vk,
-		VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(vert_pcr_data),
-		sizeof(frag_pcr_data), &frag_pcr_data);
+		vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			pipe->layout->vk, 0, 1, &view->ds, 0, NULL);
+
+		vkCmdPushConstants(cb, pipe->layout->vk,
+			VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vert_pcr_data), &vert_pcr_data);
+		vkCmdPushConstants(cb, pipe->layout->vk,
+			VK_SHADER_STAGE_FRAGMENT_BIT, sizeof(vert_pcr_data),
+			sizeof(frag_pcr_data), &frag_pcr_data);
+	}
 
 	pixman_region32_t clip;
 	get_clip_region(pass, options->clip, &clip);
@@ -936,10 +1150,12 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 	int clip_rects_len;
 	const pixman_box32_t *clip_rects = pixman_region32_rectangles(&clip, &clip_rects_len);
 	for (int i = 0; i < clip_rects_len; i++) {
-		VkRect2D rect;
-		convert_pixman_box_to_vk_rect(&clip_rects[i], &rect);
-		vkCmdSetScissor(cb, 0, 1, &rect);
-		vkCmdDraw(cb, 4, 1, 0, 0);
+		if (!custom_draw) {
+			VkRect2D rect;
+			convert_pixman_box_to_vk_rect(&clip_rects[i], &rect);
+			vkCmdSetScissor(cb, 0, 1, &rect);
+			vkCmdDraw(cb, 4, 1, 0, 0);
+		}
 
 		struct wlr_box clip_box = {
 			.x = clip_rects[i].x1,
@@ -975,6 +1191,7 @@ static void render_pass_add_texture(struct wlr_render_pass *wlr_pass,
 
 		*pass_texture = (struct wlr_vk_render_pass_texture){
 			.texture = texture,
+			.buffer = texture->buffer ? wlr_buffer_lock(texture->buffer) : NULL,
 			.wait_timeline = wait_timeline,
 			.wait_point = wait_point,
 		};
@@ -1218,6 +1435,9 @@ static const struct wlr_addon_interface vk_color_transform_impl = {
 
 struct wlr_vk_render_pass *vulkan_begin_render_pass(struct wlr_vk_renderer *renderer,
 		struct wlr_vk_render_buffer *buffer, const struct wlr_buffer_pass_options *options) {
+	if (renderer->sync_failed) {
+		return NULL;
+	}
 	uint32_t inv_eotf;
 	if (options != NULL && options->color_transform != NULL) {
 		if (options->color_transform->type == COLOR_TRANSFORM_INVERSE_EOTF) {
@@ -1233,14 +1453,19 @@ struct wlr_vk_render_pass *vulkan_begin_render_pass(struct wlr_vk_renderer *rend
 		inv_eotf = WLR_COLOR_TRANSFER_FUNCTION_GAMMA22;
 	}
 
-	bool using_linear_pathway = inv_eotf == WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR;
-	bool using_srgb_pathway = inv_eotf == WLR_COLOR_TRANSFER_FUNCTION_SRGB &&
+	bool using_linear_pathway = !renderer->offscreen_enabled &&
+		inv_eotf == WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR;
+	bool using_srgb_pathway = !renderer->offscreen_enabled &&
+		inv_eotf == WLR_COLOR_TRANSFER_FUNCTION_SRGB &&
 		buffer->srgb.out.framebuffer != VK_NULL_HANDLE;
 	bool using_two_pass_pathway = !using_linear_pathway && !using_srgb_pathway;
 
 	if (using_linear_pathway && !buffer->linear.out.image_view) {
-		struct wlr_dmabuf_attributes attribs;
-		wlr_buffer_get_dmabuf(buffer->wlr_buffer, &attribs);
+		struct wlr_dmabuf_attributes attribs = {
+			.width = buffer->wlr_buffer->width,
+			.height = buffer->wlr_buffer->height,
+			.format = buffer->format,
+		};
 		if (!vulkan_setup_one_pass_framebuffer(buffer, &attribs, false)) {
 			wlr_log(WLR_ERROR, "Failed to set up blend image");
 			return NULL;
@@ -1258,8 +1483,11 @@ struct wlr_vk_render_pass *vulkan_begin_render_pass(struct wlr_vk_renderer *rend
 		}
 
 		if (!buffer->two_pass.out.image_view) {
-			struct wlr_dmabuf_attributes attribs;
-			wlr_buffer_get_dmabuf(buffer->wlr_buffer, &attribs);
+			struct wlr_dmabuf_attributes attribs = {
+				.width = buffer->wlr_buffer->width,
+				.height = buffer->wlr_buffer->height,
+				.format = buffer->format,
+			};
 			if (!vulkan_setup_two_pass_framebuffer(buffer, &attribs)) {
 				wlr_log(WLR_ERROR, "Failed to set up blend image");
 				return NULL;
@@ -1302,8 +1530,12 @@ struct wlr_vk_render_pass *vulkan_begin_render_pass(struct wlr_vk_renderer *rend
 
 	struct wlr_vk_command_buffer *cb = vulkan_acquire_command_buffer(renderer);
 	if (cb == NULL) {
-		free(pass);
+		vulkan_render_pass_destroy(pass);
 		return NULL;
+	}
+
+	if (pass->color_transform != NULL) {
+		cb->color_transform = wlr_color_transform_ref(pass->color_transform);
 	}
 
 	VkCommandBufferBeginInfo begin_info = {
@@ -1313,12 +1545,12 @@ struct wlr_vk_render_pass *vulkan_begin_render_pass(struct wlr_vk_renderer *rend
 	if (res != VK_SUCCESS) {
 		wlr_vk_error("vkBeginCommandBuffer", res);
 		vulkan_reset_command_buffer(cb);
-		free(pass);
+		vulkan_render_pass_destroy(pass);
 		return NULL;
 	}
 
 	if (!renderer->dummy3d_image_transitioned) {
-		renderer->dummy3d_image_transitioned = true;
+		pass->transition_dummy = true;
 		vulkan_change_layout(cb->vk, renderer->dummy3d_image,
 			VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 			0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,

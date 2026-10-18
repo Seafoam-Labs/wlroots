@@ -238,6 +238,7 @@ static bool vulkan_texture_read_pixels(struct wlr_texture *wlr_texture,
 	void *p = wlr_texture_read_pixel_options_get_data(options);
 
 	return vulkan_read_pixels(texture->renderer, texture->format->vk, texture->image,
+		texture->dmabuf_imported ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		options->format, options->stride, src.width, src.height, src.x, src.y, 0, 0, p);
 }
 
@@ -812,7 +813,7 @@ struct wlr_texture *vulkan_texture_from_buffer(struct wlr_renderer *wlr_renderer
 	uint32_t format;
 	size_t stride;
 	struct wlr_dmabuf_attributes dmabuf;
-	if (wlr_buffer_get_dmabuf(buffer, &dmabuf)) {
+	if (renderer->dev->dmabuf && !vulkan_is_copy_buffer(buffer) && wlr_buffer_get_dmabuf(buffer, &dmabuf)) {
 		return vulkan_texture_from_dmabuf_buffer(renderer, buffer, &dmabuf);
 	} else if (wlr_buffer_begin_data_ptr_access(buffer,
 			WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &format, &stride)) {
