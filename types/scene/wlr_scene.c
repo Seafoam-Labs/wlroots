@@ -1723,7 +1723,9 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 	case WLR_SCENE_NODE_BUFFER:;
 		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
 
-		if (scene_buffer->is_single_pixel_buffer) {
+		// Effect masks use the texture hook even for single-pixel surfaces.
+		// The rectangle shortcut bypasses that hook and would leak square corners.
+		if (scene_buffer->is_single_pixel_buffer && !scene_buffer->force_blend) {
 			// Render the buffer as a rect, this is likely to be more efficient
 			wlr_render_pass_add_rect(data->render_pass, &(struct wlr_render_rect_options){
 				.box = dst_box,
