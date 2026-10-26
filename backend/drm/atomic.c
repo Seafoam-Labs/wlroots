@@ -324,14 +324,17 @@ bool drm_atomic_connector_prepare(struct wlr_drm_connector_state *state, bool mo
 	struct wlr_output *output = &conn->output;
 	struct wlr_drm_crtc *crtc = conn->crtc;
 
-	uint32_t mode_id = crtc->mode_id;
+	// Publish ownership as resources are acquired: both atomic and libliftoff
+	// roll back every connector, including one whose preparation failed.
+	state->mode_id = crtc->mode_id;
+	state->gamma_lut = crtc->gamma_lut;
+	state->hdr_output_metadata = conn->hdr_output_metadata;
 	if (modeset) {
-		if (!create_mode_blob(conn, state, &mode_id)) {
+		if (!create_mode_blob(conn, state, &state->mode_id)) {
 			return false;
 		}
 	}
 
-	uint32_t gamma_lut = crtc->gamma_lut;
 	if (state->base->committed & WLR_OUTPUT_STATE_COLOR_TRANSFORM) {
 		size_t dim = 0;
 		uint16_t *lut = NULL;
@@ -350,24 +353,24 @@ bool drm_atomic_connector_prepare(struct wlr_drm_connector_state *state, bool mo
 				return false;
 			}
 		} else {
-			if (!create_gamma_lut_blob(drm, dim, lut, &gamma_lut)) {
+			if (!create_gamma_lut_blob(drm, dim, lut, &state->gamma_lut)) {
 				return false;
 			}
 		}
 	}
 
-	uint32_t fb_damage_clips = 0;
+	state->fb_damage_clips = 0;
 	if ((state->base->committed & WLR_OUTPUT_STATE_DAMAGE) &&
 			crtc->primary->props.fb_damage_clips != 0) {
 		create_fb_damage_clips_blob(drm, state->primary_fb->wlr_buf->width,
-			state->primary_fb->wlr_buf->height, &state->base->damage, &fb_damage_clips);
+			state->primary_fb->wlr_buf->height, &state->base->damage, &state->fb_damage_clips);
 	}
 
-	int in_fence_fd = -1;
+	state->primary_in_fence_fd = -1;
 	if (state->wait_timeline != NULL) {
-		in_fence_fd = wlr_drm_syncobj_timeline_export_sync_file(state->wait_timeline,
+		state->primary_in_fence_fd = wlr_drm_syncobj_timeline_export_sync_file(state->wait_timeline,
 			state->wait_point);
-		if (in_fence_fd < 0) {
+		if (state->primary_in_fence_fd < 0) {
 			return false;
 		}
 	}
@@ -388,19 +391,13 @@ bool drm_atomic_connector_prepare(struct wlr_drm_connector_state *state, bool mo
 			state->base->image_description ? state->base->image_description->primaries : 0);
 	}
 
-	uint32_t hdr_output_metadata = conn->hdr_output_metadata;
 	if ((state->base->committed & WLR_OUTPUT_STATE_IMAGE_DESCRIPTION) &&
-			!create_hdr_output_metadata_blob(drm, state->base->image_description, &hdr_output_metadata)) {
+			!create_hdr_output_metadata_blob(drm, state->base->image_description, &state->hdr_output_metadata)) {
 		return false;
 	}
 
-	state->mode_id = mode_id;
-	state->gamma_lut = gamma_lut;
-	state->fb_damage_clips = fb_damage_clips;
-	state->primary_in_fence_fd = in_fence_fd;
 	state->vrr_enabled = vrr_enabled;
 	state->colorspace = colorspace;
-	state->hdr_output_metadata = hdr_output_metadata;
 	return true;
 }
 

@@ -123,6 +123,7 @@ bool wlr_drm_syncobj_merger_add(struct wlr_drm_syncobj_merger *merger,
 	}
 	if (!wlr_drm_syncobj_timeline_waiter_init(&add->waiter, src_timeline, src_point,
 			flags, loop, export_waiter_handle_ready)) {
+		free(add);
 		return false;
 	}
 	add->merger = merger;
