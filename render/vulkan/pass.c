@@ -1,6 +1,12 @@
+#include <inttypes.h>
+#include "render/vulkan/render_path.h"
 #include <assert.h>
 #include <drm_fourcc.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <wlr/util/log.h>
 #include <wlr/render/color.h>
@@ -39,6 +45,8 @@ bool wlr_vk_render_pass_get_attribs(struct wlr_render_pass *wlr_pass,
 		},
 		.subpass = 0,
 		.has_signal_timeline = pass->signal_timeline != NULL,
+		.uses_fp16_intermediate = pass->two_pass,
+		.intermediate_allocation_bytes = pass->render_buffer->two_pass.allocation_bytes,
 	};
 	return true;
 }
@@ -96,7 +104,7 @@ bool wlr_vk_render_pass_run_offscreen(struct wlr_render_pass *wlr_pass,
 
 	VkImageMemoryBarrier barrier = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		.srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
 			VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 		.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -110,7 +118,8 @@ bool wlr_vk_render_pass_run_offscreen(struct wlr_render_pass *wlr_pass,
 			.layerCount = 1,
 		},
 	};
-	vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		0, 0, NULL, 0, NULL, 1, &barrier);
 
@@ -230,6 +239,44 @@ void vulkan_render_pass_destroy(struct wlr_vk_render_pass *pass) {
 	free(pass);
 }
 
+static void vulkan_log_sync_import_failure(struct wlr_vk_renderer *renderer,
+		const char *operation, int sync_file_fd, int err) {
+	if (renderer->acquire_fail_streak != 0) {
+		return;
+	}
+	int saved_errno = errno;
+	int fd_flags = sync_file_fd >= 0 ? fcntl(sync_file_fd, F_GETFD) : -1;
+	int fd_errno = fd_flags < 0 ? errno : 0;
+	struct rlimit limit = {0};
+	bool have_limit = getrlimit(RLIMIT_NOFILE, &limit) == 0;
+	rlim_t scan = have_limit && limit.rlim_cur < 65536 ? limit.rlim_cur : 65536;
+	unsigned count = 0;
+	for (rlim_t fd = 0; fd < scan; fd++) {
+		if (fcntl((int)fd, F_GETFD) >= 0) {
+			count++;
+		}
+	}
+	wlr_log(WLR_ERROR, "Vulkan sync import diagnostic: operation=%s fd=%d fd_valid=%d "
+		"fd_errno=%d import_errno=%d open_fds=%u%s fd_scan_limit=%ju soft_limit=%ju hard_limit=%ju",
+		operation, sync_file_fd, fd_flags >= 0, fd_errno, err, count,
+		!have_limit || scan < limit.rlim_cur ? "+" : "",
+		(uintmax_t)scan, (uintmax_t)limit.rlim_cur, (uintmax_t)limit.rlim_max);
+	errno = saved_errno;
+}
+
+static bool sync_file_already_signaled(int sync_file_fd) {
+	struct pollfd pfd = {
+		.fd = sync_file_fd,
+		.events = POLLIN,
+	};
+	int ret;
+	do {
+		ret = poll(&pfd, 1, 0);
+	} while (ret < 0 && errno == EINTR);
+	return ret > 0 && (pfd.revents & POLLIN) &&
+		!(pfd.revents & (POLLERR | POLLHUP | POLLNVAL));
+}
+
 static VkSemaphore render_pass_wait_sync_file(struct wlr_vk_render_pass *pass,
 		size_t sem_index, int sync_file_fd) {
 	struct wlr_vk_renderer *renderer = pass->renderer;
@@ -268,9 +315,13 @@ static VkSemaphore render_pass_wait_sync_file(struct wlr_vk_render_pass *pass,
 		.semaphore = *sem_ptr,
 		.fd = sync_file_fd,
 	};
+	errno = 0;
 	res = renderer->dev->api.vkImportSemaphoreFdKHR(renderer->dev->dev, &import_info);
 	if (res != VK_SUCCESS) {
+		int import_errno = errno;
 		wlr_vk_error("vkImportSemaphoreFdKHR", res);
+		vulkan_log_sync_import_failure(renderer, "vkImportSemaphoreFdKHR",
+			sync_file_fd, import_errno);
 		return VK_NULL_HANDLE;
 	}
 
@@ -293,12 +344,18 @@ static bool render_pass_wait_render_buffer(struct wlr_vk_render_pass *pass,
 	}
 
 	if (!vulkan_sync_render_buffer_acquire(pass->render_buffer, sync_file_fds)) {
+		vulkan_log_sync_import_failure(pass->renderer, "render-buffer-acquire", -1, errno);
 		close_sync_files(sync_file_fds);
 		return false;
 	}
 
 	for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
 		if (sync_file_fds[i] < 0) {
+			continue;
+		}
+		if (sync_file_already_signaled(sync_file_fds[i])) {
+			close(sync_file_fds[i]);
+			sync_file_fds[i] = -1;
 			continue;
 		}
 
@@ -332,8 +389,14 @@ static bool render_pass_wait_textures(struct wlr_vk_render_pass *pass,
 		}
 
 		if (pass_texture->wait_timeline) {
+			bool signaled = false;
+			if (wlr_drm_syncobj_timeline_check(pass_texture->wait_timeline,
+					pass_texture->wait_point, 0, &signaled) && signaled) {
+				continue;
+			}
 			int sync_file_fd = wlr_drm_syncobj_timeline_export_sync_file(pass_texture->wait_timeline, pass_texture->wait_point);
 			if (sync_file_fd < 0) {
+				vulkan_log_sync_import_failure(pass->renderer, "timeline-export-sync-file", -1, errno);
 				wlr_log(WLR_ERROR, "Failed to export wait timeline point as sync_file");
 				close_sync_files(sync_file_fds);
 				return false;
@@ -343,6 +406,7 @@ static bool render_pass_wait_textures(struct wlr_vk_render_pass *pass,
 		} else {
 			struct wlr_vk_texture *texture = pass_texture->texture;
 			if (!vulkan_sync_foreign_texture_acquire(texture, sync_file_fds)) {
+				vulkan_log_sync_import_failure(pass->renderer, "foreign-texture-acquire", -1, errno);
 				wlr_log(WLR_ERROR, "Failed to wait for foreign texture DMA-BUF fence");
 				close_sync_files(sync_file_fds);
 				return false;
@@ -351,6 +415,11 @@ static bool render_pass_wait_textures(struct wlr_vk_render_pass *pass,
 
 		for (size_t i = 0; i < WLR_DMABUF_MAX_PLANES; i++) {
 			if (sync_file_fds[i] < 0) {
+				continue;
+			}
+			if (sync_file_already_signaled(sync_file_fds[i])) {
+				close(sync_file_fds[i]);
+				sync_file_fds[i] = -1;
 				continue;
 			}
 
@@ -442,8 +511,10 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 
 	uint32_t render_wait_len = 0;
 	if (!render_pass_wait_textures(pass, render_wait, &render_wait_len)) {
+		renderer->acquire_fail_streak++;
 		goto error;
 	}
+	renderer->acquire_fail_streak = 0;
 
 	if (vulkan_record_stage_cb(renderer) == VK_NULL_HANDLE) {
 		goto error;
@@ -621,15 +692,17 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 			.image = render_buffer->two_pass.blend_image,
 			.oldLayout = blend_src_layout,
 			.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			.srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT |
+				VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 			.subresourceRange = {
 				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 				.layerCount = 1,
 				.levelCount = 1,
 			},
 		};
-		vkCmdPipelineBarrier(stage_cb->vk, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		vkCmdPipelineBarrier(stage_cb->vk, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			0, 0, NULL, 0, NULL, 1, &blend_acq_barrier);
 	}
@@ -781,9 +854,18 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 
 	if (res != VK_SUCCESS) {
 		wlr_vk_error("vkQueueSubmit", res);
+		// Only OOM guarantees no submitted resource was affected. A lost
+		// device is defined by Vulkan as no longer using any resource, so it
+		// is complete: retain the pass for teardown instead of cancellation,
+		// and replace the renderer. Any other result may have accepted work
+		// without a usable completion point.
+		pass->submission = res == VK_ERROR_OUT_OF_HOST_MEMORY || res == VK_ERROR_OUT_OF_DEVICE_MEMORY ?
+			WLR_VK_PASS_REJECTED : res == VK_ERROR_DEVICE_LOST ?
+			WLR_VK_PASS_COMPLETE : WLR_VK_PASS_UNKNOWN;
 		goto error;
 	}
 
+	pass->submission = WLR_VK_PASS_PENDING;
 	stage_cb->submitted = true;
 	render_cb->submitted = true;
 	renderer->last_submitted_point = render_timeline_point;
@@ -791,6 +873,7 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 	pass->render_buffer_out->transitioned = true;
 	if (pass->two_pass) {
 		render_buffer->two_pass.blend_transitioned = true;
+		render_buffer->two_pass.last_used_point = render_timeline_point;
 	}
 	if (pass->transition_dummy) {
 		renderer->dummy3d_image_transitioned = true;
@@ -813,7 +896,7 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
 	}
 
 	bool copied = !render_buffer->copy_target || vulkan_copy_buffer_finish(pass);
-	if (!copied && !pass->completion_proven) {
+	if (!copied && pass->submission != WLR_VK_PASS_COMPLETE) {
         vulkan_fail_render_pass(pass);
         return false;
     }
@@ -836,12 +919,18 @@ error:
 	// survive cancellation: textures/LUTs already reference those uploads.
 	// After taking it, it also contains this pass's ownership barriers. A
 	// recording/submission failure there requires renderer replacement.
-	if (stage_cb != NULL || renderer->sync_failed || !vulkan_cancel_render_pass(pass)) {
+	if (stage_cb != NULL || renderer->sync_failed || pass->submission == WLR_VK_PASS_COMPLETE ||
+			!vulkan_cancel_render_pass(pass)) {
 		vulkan_fail_render_pass(pass);
 		return false;
 	}
 	vulkan_render_pass_destroy(pass);
 	wlr_buffer_unlock(render_buffer->wlr_buffer);
+	if (renderer->acquire_fail_streak >= WLR_VK_ACQUIRE_FAIL_LIMIT) {
+		wlr_log(WLR_ERROR, "Acquire synchronization failed %u consecutive times; replacing renderer",
+			(unsigned)renderer->acquire_fail_streak);
+		vulkan_fail_acquire_sync(renderer);
+	}
 	return false;
 }
 
@@ -1453,12 +1542,24 @@ struct wlr_vk_render_pass *vulkan_begin_render_pass(struct wlr_vk_renderer *rend
 		inv_eotf = WLR_COLOR_TRANSFER_FUNCTION_GAMMA22;
 	}
 
-	bool using_linear_pathway = !renderer->offscreen_enabled &&
-		inv_eotf == WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR;
-	bool using_srgb_pathway = !renderer->offscreen_enabled &&
-		inv_eotf == WLR_COLOR_TRANSFER_FUNCTION_SRGB &&
-		buffer->srgb.out.framebuffer != VK_NULL_HANDLE;
-	bool using_two_pass_pathway = !using_linear_pathway && !using_srgb_pathway;
+    bool backdrop = renderer->offscreen_enabled || (options && options->sampleable_backdrop);
+    enum wlr_vk_render_path path = vulkan_choose_render_path(inv_eotf, backdrop,
+        buffer->srgb.out.framebuffer != VK_NULL_HANDLE);
+    bool using_linear_pathway = path == WLR_VK_PATH_LINEAR;
+    bool using_srgb_pathway = path == WLR_VK_PATH_SRGB;
+    bool using_two_pass_pathway = !using_linear_pathway && !using_srgb_pathway;
+    if (using_two_pass_pathway) {
+        buffer->two_pass.unused_passes = 0;
+    } else if (buffer->two_pass.blend_image != VK_NULL_HANDLE) {
+        if (buffer->two_pass.unused_passes < 8) buffer->two_pass.unused_passes++;
+        uint64_t completed = 0;
+        VkResult result = renderer->dev->api.vkGetSemaphoreCounterValueKHR(
+            renderer->dev->dev, renderer->timeline_semaphore, &completed);
+        if (result == VK_SUCCESS && vulkan_blend_can_retire(
+                buffer->two_pass.unused_passes, buffer->two_pass.last_used_point, completed)) {
+            vulkan_release_blend_image(buffer);
+        }
+    }
 
 	if (using_linear_pathway && !buffer->linear.out.image_view) {
 		struct wlr_dmabuf_attributes attribs = {
@@ -1494,6 +1595,14 @@ struct wlr_vk_render_pass *vulkan_begin_render_pass(struct wlr_vk_renderer *rend
 			}
 		}
 	}
+
+    const char *metrics = getenv("AQUEOUS_RENDER_METRICS");
+    if (metrics && strcmp(metrics, "0") != 0) {
+        static const char *names[] = { "direct-linear", "direct-srgb", "fp16-backdrop", "fp16-color-transform" };
+        wlr_log(WLR_INFO, "render-metric kind=vulkan-path width=%d height=%d path=%s intermediate_bytes=%" PRIu64,
+            buffer->wlr_buffer->width, buffer->wlr_buffer->height,
+            names[path], (uint64_t)buffer->two_pass.allocation_bytes);
+    }
 
 	struct wlr_vk_render_format_setup *render_setup;
 	struct wlr_vk_render_buffer_out *buffer_out;

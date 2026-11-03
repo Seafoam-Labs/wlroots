@@ -69,6 +69,10 @@ typedef bool (*wlr_scene_rect_render_hook_func_t)(
 typedef bool (*wlr_scene_buffer_needs_composition_func_t)(
 	struct wlr_scene_buffer *scene_buffer, void *data);
 
+/* Called for visible render-list nodes before choosing a framebuffer. */
+typedef bool (*wlr_scene_node_needs_backdrop_func_t)(
+    struct wlr_scene_node *node, void *data);
+
 typedef uint32_t (*wlr_scene_render_begin_hook_func_t)(
 	struct wlr_render_pass *render_pass,
 	const pixman_region32_t *content_damage, void *data);
@@ -188,6 +192,8 @@ struct wlr_scene_output_sample_event {
 	bool direct_scanout;
 	struct wlr_drm_syncobj_timeline *release_timeline;
 	uint64_t release_point;
+	// Scene composition retains the surface release merger until submission.
+	bool release_deferred;
 };
 
 struct wlr_scene_frame_done_event {
@@ -321,6 +327,8 @@ struct wlr_scene_output {
 		unsigned color_pipeline_retry_frames;
 		uint64_t color_pipeline_scanout_key;
 		unsigned color_pipeline_scanout_retry_frames;
+		wlr_scene_node_needs_backdrop_func_t node_needs_backdrop;
+		bool previous_sampleable_backdrop;
 	} WLR_PRIVATE;
 };
 
@@ -721,6 +729,14 @@ void wlr_scene_output_set_render_hooks(
 	struct wlr_scene_output *scene_output,
 	wlr_scene_render_begin_hook_func_t begin_hook,
 	wlr_scene_node_render_hook_func_t node_hook);
+
+/**
+ * Query visible scene nodes before framebuffer selection. Returning true
+ * requires a sampleable linear backdrop for this output's render pass.
+ */
+void wlr_scene_output_set_backdrop_requirement(
+	struct wlr_scene_output *scene_output,
+	wlr_scene_node_needs_backdrop_func_t hook);
 
 /**
  * Set a callback invoked when scene content damages this output. The source is

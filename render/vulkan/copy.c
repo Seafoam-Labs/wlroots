@@ -123,19 +123,11 @@ void vulkan_copy_buffer_record(struct wlr_vk_render_buffer *buffer, VkCommandBuf
 
 bool vulkan_copy_buffer_finish(struct wlr_vk_render_pass *pass) {
     struct wlr_vk_render_buffer *buffer = pass->render_buffer;
-    const VkSemaphoreWaitInfoKHR wait = {
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR,
-        .semaphoreCount = 1,
-        .pSemaphores = &pass->renderer->timeline_semaphore,
-        .pValues = &pass->command_buffer->timeline_point,
-    };
-    VkResult waited = pass->renderer->dev->api.vkWaitSemaphoresKHR(
-        pass->renderer->dev->dev, &wait, 1000000000ULL);
-    if (waited != VK_SUCCESS) {
-        wlr_vk_error("Vulkan presentation copy completion (1 second limit)", waited);
+    // Device loss establishes resource completion, but the pixel contents are
+    // undefined. Never map or publish them as a successful presentation copy.
+    if (!vulkan_wait_render_pass(pass) || pass->renderer->sync_failed) {
         return false;
     }
-    pass->completion_proven = true;
     VkMappedMemoryRange range = {
         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
         .memory = buffer->copy_memory, .offset = 0, .size = VK_WHOLE_SIZE,

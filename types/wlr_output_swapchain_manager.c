@@ -184,8 +184,7 @@ static bool manager_test(struct wlr_output_swapchain_manager *manager,
 			return false;
 		}
 		if (!manager_output_prepare(manager_output, &state->base, explicit_modifiers)) {
-			if (!wlr_output_try_presentation_copy(state->output) ||
-					!manager_output_prepare(manager_output, &state->base, explicit_modifiers)) return false;
+			return false;
 		}
 	}
 

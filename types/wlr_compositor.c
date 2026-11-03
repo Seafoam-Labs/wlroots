@@ -1177,6 +1177,7 @@ void wlr_surface_send_enter(struct wlr_surface *surface,
 	surface_output->surface = surface;
 	surface_output->output = output;
 	wl_list_insert(&surface->current_outputs, &surface_output->link);
+	wlr_fifo_v1_surface_changed(surface);
 
 	wl_resource_for_each(resource, &output->resources) {
 		if (client == wl_resource_get_client(resource)) {

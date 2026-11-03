@@ -46,6 +46,8 @@ struct wlr_buffer_pass_options {
 	 */
 	struct wlr_drm_syncobj_timeline *signal_timeline;
 	uint64_t signal_point;
+	/* Require a sampleable linear backdrop for this pass only. */
+	bool sampleable_backdrop;
 };
 
 /**

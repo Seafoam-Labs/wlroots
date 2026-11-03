@@ -271,8 +271,13 @@ struct wlr_vk_render_buffer {
 		VkDescriptorSet blend_descriptor_set;
 		struct wlr_vk_descriptor_pool *blend_attachment_pool;
 		bool blend_transitioned;
+		VkDeviceSize allocation_bytes;
+		uint64_t last_used_point;
+		unsigned unused_passes;
 	} two_pass;
 };
+
+void vulkan_release_blend_image(struct wlr_vk_render_buffer *buffer);
 
 bool vulkan_setup_one_pass_framebuffer(struct wlr_vk_render_buffer *buffer,
 	const struct wlr_dmabuf_attributes *dmabuf, bool srgb);
@@ -349,6 +354,7 @@ struct wlr_vk_renderer {
 	struct wlr_drm_format_set copy_formats;
 	bool offscreen_enabled;
 	bool sync_failed;
+	uint32_t acquire_fail_streak;
 	uint64_t last_submitted_point;
 	struct wlr_vk_render_pass *failed_passes;
 
@@ -437,10 +443,34 @@ struct wlr_vk_render_pass_texture {
 	uint64_t wait_point;
 };
 
+// A rejected submit (OOM) leaves resources untouched. An unknown submit result
+// is neither cancellation nor completion. VK_ERROR_DEVICE_LOST is different:
+// Vulkan defines it as equivalent to VK_SUCCESS when deciding whether command
+// buffers or resources are still in use by the device, so a lost device counts
+// as COMPLETE (never as REJECTED/cancelled) and its pass is retained for
+// teardown while the renderer is replaced.
+enum wlr_vk_pass_submission {
+	WLR_VK_PASS_NOT_SUBMITTED,
+	WLR_VK_PASS_REJECTED,
+	WLR_VK_PASS_PENDING,
+	WLR_VK_PASS_COMPLETE,
+	WLR_VK_PASS_UNKNOWN,
+};
+
+// Recovery polls the timeline semaphore in bounded slices. A slice which times
+// out proves nothing about GPU completion, so recovery retries a limited number
+// of slices (~10 s in total) before it gives up and the renderer must stop.
+#define WLR_VK_RECOVERY_WAIT_SLICE_NS 1000000000ULL
+#define WLR_VK_RECOVERY_WAIT_SLICES 10
+
+// Consecutive pre-submit dependency acquire/import failures before replacing
+// the Vulkan renderer (e.g. driver-internal FD exhaustion).
+#define WLR_VK_ACQUIRE_FAIL_LIMIT 8
+
 struct wlr_vk_render_pass {
 	struct wlr_vk_render_pass *next_failed;
 	bool transition_dummy;
-	bool completion_proven;
+	enum wlr_vk_pass_submission submission;
 	struct wlr_render_pass base;
 	struct wlr_vk_renderer *renderer;
 	struct wlr_vk_render_buffer *render_buffer;
@@ -620,10 +650,14 @@ void vulkan_change_layout(VkCommandBuffer cb, VkImage img,
 
 #endif
 
-// Error-path recovery only. Never wait on an allocated but unsubmitted point.
+// Never wait on an allocated but unsubmitted point.
 bool vulkan_cancel_render_pass(struct wlr_vk_render_pass *pass);
+// Establish resource completion, including device loss. Check sync_failed before
+// consuming rendered pixels: completion on a lost device does not validate data.
+bool vulkan_wait_render_pass(struct wlr_vk_render_pass *pass);
 bool vulkan_recover_render_pass(struct wlr_vk_render_pass *pass);
 void vulkan_fail_render_pass(struct wlr_vk_render_pass *pass);
+void vulkan_fail_acquire_sync(struct wlr_vk_renderer *renderer);
 void vulkan_render_pass_destroy(struct wlr_vk_render_pass *pass);
 
 #endif // RENDER_VULKAN_H

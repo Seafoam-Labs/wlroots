@@ -19,14 +19,14 @@ bool wlr_vk_renderer_requires_copy(struct wlr_renderer *renderer);
 struct wlr_allocator *wlr_vk_copy_allocator_create(struct wlr_allocator *destination);
 const struct wlr_drm_format_set *wlr_vk_renderer_get_copy_formats(struct wlr_renderer *renderer);
 
-#define WLR_AQUEOUS_RENDER_HOOK_VERSION 10
+#define WLR_AQUEOUS_RENDER_HOOK_VERSION 11
 
 #define WLR_AQUEOUS_VULKAN_SELECTION_VERSION 1
 struct wlr_backend;
 struct wlr_vk_renderer_candidates;
 /**
- * Snapshot usable Vulkan physical devices in preferred hardware, other hardware,
- * then CPU order. Explicit WLR_RENDER_DRM_DEVICE and FORCE_SOFTWARE restrictions
+ * Snapshot usable Vulkan physical devices in requested type, other hardware,
+ * then CPU order. AQUEOUS_RENDER_GPU_PREFERENCE is auto/integrated/discrete. Explicit WLR_RENDER_DRM_DEVICE and FORCE_SOFTWARE restrictions
  * are honored. No renderer or logical device is created until next().
  */
 struct wlr_vk_renderer_candidates *wlr_vk_renderer_candidates_create(
@@ -51,6 +51,8 @@ struct wlr_vk_render_pass_attribs {
 	VkExtent2D extent;
 	uint32_t subpass;
 	bool has_signal_timeline;
+	bool uses_fp16_intermediate;
+	uint64_t intermediate_allocation_bytes;
 };
 
 struct wlr_vk_render_texture_attribs {

@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <xf86drm.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -106,26 +107,36 @@ int wlr_drm_syncobj_timeline_export_sync_file(struct wlr_drm_syncobj_timeline *t
 		uint64_t src_point) {
 	int sync_file_fd = -1;
 
+	int error = 0;
 	uint32_t syncobj_handle;
 	if (drmSyncobjCreate(timeline->drm_fd, 0, &syncobj_handle) != 0) {
+		error = errno;
 		wlr_log_errno(WLR_ERROR, "drmSyncobjCreate failed");
+		errno = error;
 		return -1;
 	}
 
 	if (drmSyncobjTransfer(timeline->drm_fd, syncobj_handle, 0,
 			timeline->handle, src_point, 0) != 0) {
+		error = errno;
 		wlr_log_errno(WLR_ERROR, "drmSyncobjTransfer failed");
+		errno = error;
 		goto out;
 	}
 
 	if (drmSyncobjExportSyncFile(timeline->drm_fd,
 			syncobj_handle, &sync_file_fd) != 0) {
+		error = errno;
 		wlr_log_errno(WLR_ERROR, "drmSyncobjExportSyncFile failed");
+		errno = error;
 		goto out;
 	}
 
 out:
 	drmSyncobjDestroy(timeline->drm_fd, syncobj_handle);
+	if (error != 0) {
+		errno = error;
+	}
 	return sync_file_fd;
 }
 
@@ -133,21 +144,28 @@ bool wlr_drm_syncobj_timeline_import_sync_file(struct wlr_drm_syncobj_timeline *
 		uint64_t dst_point, int sync_file_fd) {
 	bool ok = false;
 
+	int error = 0;
 	uint32_t syncobj_handle;
 	if (drmSyncobjCreate(timeline->drm_fd, 0, &syncobj_handle) != 0) {
+		error = errno;
 		wlr_log_errno(WLR_ERROR, "drmSyncobjCreate failed");
+		errno = error;
 		return false;
 	}
 
 	if (drmSyncobjImportSyncFile(timeline->drm_fd, syncobj_handle,
 			sync_file_fd) != 0) {
+		error = errno;
 		wlr_log_errno(WLR_ERROR, "drmSyncobjImportSyncFile failed");
+		errno = error;
 		goto out;
 	}
 
 	if (drmSyncobjTransfer(timeline->drm_fd, timeline->handle, dst_point,
 			syncobj_handle, 0, 0) != 0) {
+		error = errno;
 		wlr_log_errno(WLR_ERROR, "drmSyncobjTransfer failed");
+		errno = error;
 		goto out;
 	}
 
@@ -155,6 +173,9 @@ bool wlr_drm_syncobj_timeline_import_sync_file(struct wlr_drm_syncobj_timeline *
 
 out:
 	drmSyncobjDestroy(timeline->drm_fd, syncobj_handle);
+	if (error != 0) {
+		errno = error;
+	}
 	return ok;
 }
 
@@ -170,6 +191,7 @@ bool wlr_drm_syncobj_timeline_check(struct wlr_drm_syncobj_timeline *timeline,
 	int ret = drmSyncobjTimelineWait(timeline->drm_fd, &timeline->handle, &point, 1, 0, flags, NULL);
 	if (ret != 0 && ret != -etime) {
 		wlr_log_errno(WLR_ERROR, "drmSyncobjTimelineWait() failed");
+		errno = -ret;
 		return false;
 	}
 
@@ -179,7 +201,9 @@ bool wlr_drm_syncobj_timeline_check(struct wlr_drm_syncobj_timeline *timeline,
 
 bool wlr_drm_syncobj_timeline_signal(struct wlr_drm_syncobj_timeline *timeline, uint64_t point) {
 	if (drmSyncobjTimelineSignal(timeline->drm_fd, &timeline->handle, &point, 1) != 0) {
+		int error = errno;
 		wlr_log(WLR_ERROR, "drmSyncobjTimelineSignal() failed");
+		errno = error;
 		return false;
 	}
 	return true;
@@ -212,11 +236,14 @@ bool wlr_drm_syncobj_timeline_waiter_init(struct wlr_drm_syncobj_timeline_waiter
 #if HAVE_EVENTFD
 	ev_fd = eventfd(0, EFD_CLOEXEC);
 	if (ev_fd < 0) {
+		int error = errno;
 		wlr_log_errno(WLR_ERROR, "eventfd() failed");
+		errno = error;
 	}
 #else
 	ev_fd = -1;
 	wlr_log(WLR_ERROR, "eventfd() is unavailable");
+	errno = ENOSYS;
 #endif
 	if (ev_fd < 0) {
 		return false;
@@ -229,15 +256,19 @@ bool wlr_drm_syncobj_timeline_waiter_init(struct wlr_drm_syncobj_timeline_waiter
 		.fd = ev_fd,
 	};
 	if (drmIoctl(timeline->drm_fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &syncobj_eventfd) != 0) {
+		int error = errno;
 		wlr_log_errno(WLR_ERROR, "DRM_IOCTL_SYNCOBJ_EVENTFD failed");
 		close(ev_fd);
+		errno = error;
 		return false;
 	}
 
 	struct wl_event_source *source = wl_event_loop_add_fd(loop, ev_fd, WL_EVENT_READABLE, handle_eventfd_ready, waiter);
 	if (source == NULL) {
+		int error = errno;
 		wlr_log(WLR_ERROR, "Failed to add FD to event loop");
 		close(ev_fd);
+		errno = error;
 		return false;
 	}
 

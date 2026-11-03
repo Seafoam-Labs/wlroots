@@ -1,5 +1,8 @@
 #include "types/wlr_scene.h"
 #include "render/color.h"
+#include "render/drm_syncobj_merger.h"
+#include <inttypes.h>
+#include <wlr/types/wlr_linux_drm_syncobj_v1.h>
 #include "render/color_pipeline.h"
 #include "render/drm_format_set.h"
 #include "types/wlr_output.h"
@@ -1606,6 +1609,8 @@ struct wlr_scene_node *wlr_scene_node_at(struct wlr_scene_node *node,
 }
 
 struct render_list_entry {
+	// Storage is allocated with the render list, before any sampling work.
+	struct wlr_drm_syncobj_merger *release_merger;
 	struct wlr_scene_node *node;
 	bool highlight_transparent_region;
 	double x, y;
@@ -1662,6 +1667,68 @@ static float scene_buffer_luminance(struct wlr_scene_buffer *scene_buffer,
 	}
 
 	return luminance_multiplier;
+}
+
+// Keep the exact buffer generation alive across submission and callbacks. A
+// buffer lock alone cannot prevent explicit-sync clients from reusing it.
+static void scene_entry_prepare_release(struct render_list_entry *entry,
+		struct wlr_scene_buffer *buffer, struct wlr_scene_output *output) {
+	assert(entry->release_merger == NULL);
+	if (output->in_timeline == NULL) {
+		return;
+	}
+	struct wlr_scene_surface *surface = wlr_scene_surface_try_from_buffer(buffer);
+	if (surface == NULL) {
+		return;
+	}
+	struct wlr_linux_drm_syncobj_surface_v1_state *state =
+		wlr_linux_drm_syncobj_v1_get_surface_state(surface->surface);
+	if (state != NULL && state->release_merger != NULL) {
+		// Every sampling output contributes, even when it is not the output
+		// used for presentation feedback and frame pacing.
+		entry->release_merger = wlr_drm_syncobj_merger_ref(state->release_merger);
+	}
+}
+
+static bool scene_render_list_submit(struct wlr_render_pass *pass,
+		struct render_list_entry *entries, int len, struct wlr_scene_output *output) {
+	bool vulkan = false;
+#if WLR_HAS_VULKAN_RENDERER
+	vulkan = wlr_renderer_is_vk(output->output->renderer);
+#endif
+	bool submitted = wlr_render_pass_submit(pass);
+	for (int i = 0; i < len; i++) {
+		struct wlr_drm_syncobj_merger *merger = entries[i].release_merger;
+		if (merger == NULL) {
+			continue;
+		}
+		// The pinned Vulkan failure handler returns only for work that was
+		// not submitted, or after establishing completion (a lost device
+		// counts: Vulkan defines it as no longer using any resource).
+		// Unknown/pending submissions terminate there. Do not wait for a
+		// rejected frame's unsubmitted point; dropping just this ref preserves
+		// older inputs.
+		// Other renderers retain their existing release-point contract.
+		if (submitted || !vulkan) {
+			unsigned recoveries = merger->recovery_count;
+			bool ok = wlr_drm_syncobj_merger_add(merger, output->in_timeline,
+				output->in_point, output->output->event_loop);
+			if (!ok || merger->recovery_count != recoveries) {
+				wlr_log(WLR_ERROR, "Scene release recovery: output=%s renderer=%s "
+					"submission=%s drm_fd=%d handle=%"PRIu32" point=%"PRIu64" result=%s",
+					output->output->name, vulkan ? "vulkan" : "other",
+					submitted ? "submitted" : "failed",
+					output->in_timeline->drm_fd, output->in_timeline->handle,
+					output->in_point, ok ? "recovered" : "fatal");
+			}
+			if (!ok) {
+				abort(); // completion cannot be proved; never release early
+			}
+		}
+		entries[i].release_merger = NULL;
+		wlr_drm_syncobj_merger_unref(merger);
+	}
+	return submitted;
 }
 
 static void scene_entry_render(struct render_list_entry *entry, const struct render_data *data) {
@@ -1793,6 +1860,7 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 				data->render_pass, scene_buffer_render_hook_bridge, &hook_call);
 		}
 #endif
+		scene_entry_prepare_release(entry, scene_buffer, data->output);
 		wlr_render_pass_add_texture(data->render_pass, &texture_options);
 #if WLR_HAS_VULKAN_RENDERER
 		if (texture_hook_installed) {
@@ -1805,6 +1873,7 @@ static void scene_entry_render(struct render_list_entry *entry, const struct ren
 			.direct_scanout = false,
 			.release_timeline = data->output->in_timeline,
 			.release_point = data->output->in_point,
+			.release_deferred = true,
 		};
 		wl_signal_emit_mutable(&scene_buffer->events.output_sample, &sample_event);
 
@@ -2203,6 +2272,13 @@ void wlr_scene_output_set_render_hooks(
 	scene_output->node_render_hook = node_hook;
 	wlr_damage_ring_add_whole(&scene_output->damage_ring);
 	wlr_output_schedule_frame(scene_output->output);
+}
+
+void wlr_scene_output_set_backdrop_requirement(struct wlr_scene_output *scene_output,
+        wlr_scene_node_needs_backdrop_func_t hook) {
+    scene_output->node_needs_backdrop = hook;
+    wlr_damage_ring_add_whole(&scene_output->damage_ring);
+    wlr_output_schedule_frame(scene_output->output);
 }
 
 void wlr_scene_output_set_damage_hook(
@@ -3153,6 +3229,21 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 
 	struct render_list_entry *list_data = list_con.render_list->data;
 	int list_len = list_con.render_list->size / sizeof(*list_data);
+    bool sampleable_backdrop = false;
+    if (scene_output->node_needs_backdrop != NULL) {
+        for (int i = 0; i < list_len; i++) {
+            if (scene_output->node_needs_backdrop(list_data[i].node,
+                    scene_output->render_hook_data)) {
+                sampleable_backdrop = true;
+                break;
+            }
+        }
+    }
+    // Direct and intermediate attachments do not share preserved contents.
+    if (sampleable_backdrop != scene_output->previous_sampleable_backdrop) {
+        scene_output_damage_whole(scene_output);
+        scene_output->previous_sampleable_backdrop = sampleable_backdrop;
+    }
 
 	if (debug_damage == WLR_SCENE_DEBUG_DAMAGE_RERENDER) {
 		scene_output_damage_whole(scene_output);
@@ -3355,6 +3446,7 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 											 : scene_output->combined_color_transform,
 			.signal_timeline = scene_output->in_timeline,
 			.signal_point = scene_output->in_point,
+			.sampleable_backdrop = sampleable_backdrop,
 		});
 	if (render_pass == NULL) {
 		wlr_buffer_unlock(buffer);
@@ -3482,7 +3574,7 @@ bool wlr_scene_output_build_state(struct wlr_scene_output *scene_output,
 	wlr_output_add_software_cursors_to_render_pass(output, render_pass, &render_data.damage);
 	pixman_region32_fini(&render_data.damage);
 
-	if (!wlr_render_pass_submit(render_pass)) {
+	if (!scene_render_list_submit(render_pass, list_data, list_len, scene_output)) {
 		wlr_buffer_unlock(buffer);
 
 		// if we failed to render the buffer, it will have undefined contents

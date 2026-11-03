@@ -12,6 +12,8 @@ struct wlr_drm_syncobj_merger {
 	struct wlr_drm_syncobj_timeline *dst_timeline;
 	uint64_t dst_point;
 	int sync_fd;
+	unsigned recovery_count; // diagnostic context for synchronous callers
+	bool failed; // an input dependency could not be retained or proven complete
 };
 
 /**
@@ -28,7 +30,8 @@ struct wlr_drm_syncobj_merger *wlr_drm_syncobj_merger_ref(
 
 /**
  * Target timeline point is materialized when all inputs are, and the merger is
- * destroyed.
+ * destroyed. Publication failures use a bounded completion wait; an unresolved
+ * dependency or failed final signal is fatal, never an already-signalled fence.
  */
 void wlr_drm_syncobj_merger_unref(struct wlr_drm_syncobj_merger *merger);
 /**
@@ -36,6 +39,7 @@ void wlr_drm_syncobj_merger_unref(struct wlr_drm_syncobj_merger *merger);
  *
  * If the point is not materialized, the supplied event loop is used to schedule
  * a wait.
+ * On failure the merger is poisoned and must not publish a release point.
  */
 bool wlr_drm_syncobj_merger_add(struct wlr_drm_syncobj_merger *merger,
 	struct wlr_drm_syncobj_timeline *dst_timeline, uint64_t dst_point,

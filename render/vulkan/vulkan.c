@@ -774,6 +774,21 @@ struct wlr_vk_renderer_candidates *wlr_vk_renderer_candidates_create(
 	VkPhysicalDevice *devices = NULL;
 	bool software_only = env_parse_bool("WLR_RENDERER_FORCE_SOFTWARE");
 	const char *explicit_path = getenv("WLR_RENDER_DRM_DEVICE");
+	// A soft type preference never filters out usable fallback devices. The
+	// explicit DRM path and software-only restriction remain authoritative.
+	const char *preference = getenv("AQUEOUS_RENDER_GPU_PREFERENCE");
+	VkPhysicalDeviceType preferred_type = VK_PHYSICAL_DEVICE_TYPE_OTHER;
+	if (preference && strcmp(preference, "integrated") == 0) {
+		preferred_type = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+	} else if (preference && strcmp(preference, "discrete") == 0) {
+		preferred_type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+	} else if (preference && strcmp(preference, "auto") != 0) {
+		wlr_log(WLR_ERROR, "Invalid AQUEOUS_RENDER_GPU_PREFERENCE '%s'; using auto", preference);
+		preference = "auto";
+	}
+	wlr_log(WLR_INFO, "Vulkan render preference: %s; explicit device: %s; software-only: %s",
+		preference ? preference : "auto", explicit_path ? explicit_path : "none",
+		software_only ? "yes" : "no");
 	dev_t preferred = 0;
 	if (explicit_path) {
 		struct stat st;
@@ -818,7 +833,7 @@ struct wlr_vk_renderer_candidates *wlr_vk_renderer_candidates_create(
 	// Stable ordering keeps separate ICD implementations of a device as distinct
 	// candidates. A virtual GPU is hardware; only VK_PHYSICAL_DEVICE_TYPE_CPU is
 	// software. Loader device filtering (VK_DRIVER_FILES, etc.) still applies.
-	for (unsigned rank = 0; rank < 3; rank++) {
+	for (unsigned rank = 0; rank < 5; rank++) {
 		for (uint32_t i = 0; i < count; i++) {
 			VkPhysicalDeviceProperties props;
 			vkGetPhysicalDeviceProperties(devices[i], &props);
@@ -834,8 +849,14 @@ struct wlr_vk_renderer_candidates *wlr_vk_renderer_candidates_create(
 					(software_only && !cpu) || (cpu && !allow_software)) {
 				continue;
 			}
-			unsigned device_rank = cpu ? 2 : matches ? 0 : 1;
+			// Prefer the backend within each type, retaining loader order for ties
+			// and alternate ICDs. Virtual GPUs remain hardware; CPU stays last.
+			bool other_type = preferred_type != VK_PHYSICAL_DEVICE_TYPE_OTHER &&
+				props.deviceType != preferred_type;
+			unsigned device_rank = cpu ? 4 : (other_type ? 2 : 0) + (matches ? 0 : 1);
 			if (rank == device_rank) {
+				wlr_log(WLR_INFO, "Vulkan candidate rank=%u type=%u backend_match=%s: %s",
+					device_rank, (unsigned)props.deviceType, matches ? "yes" : "no", props.deviceName);
 				candidates->devices[candidates->len++] = devices[i];
 			}
 		}

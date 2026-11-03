@@ -2,6 +2,7 @@
 #include <wlr/types/wlr_fifo_v1.h>
 #include <math.h>
 #include <stdlib.h>
+#include <wlr/util/log.h>
 #include <wlr/types/wlr_alpha_modifier_v1.h>
 #include <wlr/types/wlr_color_management_v1.h>
 #include <wlr/types/wlr_color_representation_v1.h>
@@ -218,9 +219,13 @@ static void handle_scene_buffer_output_sample(
 
 	struct wlr_linux_drm_syncobj_surface_v1_state *syncobj_surface_state =
 		wlr_linux_drm_syncobj_v1_get_surface_state(surface->surface);
-	if (syncobj_surface_state != NULL && event->release_timeline != NULL) {
-		wlr_linux_drm_syncobj_v1_state_add_release_point(syncobj_surface_state,
-			event->release_timeline, event->release_point, output->event_loop);
+	if (syncobj_surface_state != NULL && event->release_timeline != NULL &&
+			!event->release_deferred) {
+		if (!wlr_linux_drm_syncobj_v1_state_add_release_point(syncobj_surface_state,
+				event->release_timeline, event->release_point, output->event_loop)) {
+			wlr_log(WLR_ERROR, "Cannot retain scene buffer release dependency; terminating before unsafe reuse");
+			abort();
+		}
 	}
 }
 

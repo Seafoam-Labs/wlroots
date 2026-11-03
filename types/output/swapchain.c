@@ -68,7 +68,7 @@ static bool test_swapchain(struct wlr_output *output,
 	return ok;
 }
 
-static bool configure_primary_swapchain(struct wlr_output *output,
+bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
 		const struct wlr_output_state *state, struct wlr_swapchain **swapchain_ptr) {
 	struct wlr_output_state empty_state;
 	if (state == NULL) {
@@ -122,9 +122,3 @@ static bool configure_primary_swapchain(struct wlr_output *output,
 	return true;
 }
 
-bool wlr_output_configure_primary_swapchain(struct wlr_output *output,
-		const struct wlr_output_state *state, struct wlr_swapchain **swapchain_ptr) {
-	if (configure_primary_swapchain(output, state, swapchain_ptr)) return true;
-	if (!wlr_output_try_presentation_copy(output)) return false;
-	return configure_primary_swapchain(output, state, swapchain_ptr);
-}

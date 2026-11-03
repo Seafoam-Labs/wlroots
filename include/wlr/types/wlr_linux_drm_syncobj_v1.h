@@ -67,7 +67,12 @@ bool wlr_linux_drm_syncobj_v1_state_signal_release_with_buffer(
  * a new buffer has been committed.
  *
  * Because the given release point may not be materialized, a wl_event_loop must
- * be supplied to schedule a wait internally, if needed
+ * be supplied to schedule a wait internally, if needed.
+ *
+ * Returns false if a dependency could neither be retained nor proven complete
+ * by bounded error recovery. The caller must stop dispatching before clients
+ * can reuse the buffer. Deferred failures and final publication failures are
+ * fatal if bounded recovery cannot make release safe.
  */
 bool wlr_linux_drm_syncobj_v1_state_add_release_point(
 	struct wlr_linux_drm_syncobj_surface_v1_state *state,
