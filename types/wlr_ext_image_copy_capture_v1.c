@@ -50,7 +50,7 @@ struct wlr_ext_image_copy_capture_frame_v1 *wlr_ext_image_copy_capture_frame_v1_
 	return wl_resource_get_user_data(resource);
 }
 
-static struct wlr_ext_image_copy_capture_session_v1 *session_from_resource(
+struct wlr_ext_image_copy_capture_session_v1 *wlr_ext_image_copy_capture_session_v1_from_resource(
 		struct wl_resource *resource) {
 	assert(wl_resource_instance_of(resource,
 		&ext_image_copy_capture_session_v1_interface, &session_impl));
@@ -108,12 +108,25 @@ void wlr_ext_image_copy_capture_frame_v1_ready(struct wlr_ext_image_copy_capture
 	frame_destroy(frame);
 }
 
+// pq_source is set when an 8-bit destination needs the PQ source converted
+// to SDR. This matches the SHM conversion (screencopy_sdr_conversion_init):
+// SDR white returns to 1.0, BT.2020 maps to sRGB, and the default output
+// encoding is gamma 2.2. Highlights and out-of-gamut colors clip.
 static bool copy_dmabuf(struct wlr_buffer *dst,
 		struct wlr_buffer *src, struct wlr_renderer *renderer,
-		const pixman_region32_t *clip) {
+		const pixman_region32_t *clip,
+		const struct wlr_output_image_description *pq_source) {
 	struct wlr_texture *texture = wlr_texture_from_buffer(renderer, src);
 	if (texture == NULL) {
 		return false;
+	}
+
+	struct wlr_color_primaries primaries;
+	float luminance_multiplier = 1.0f;
+	if (pq_source) {
+		wlr_color_primaries_from_named(&primaries, pq_source->primaries);
+		double white = pq_source->sdr_white_level > 0 ? pq_source->sdr_white_level : 203.0;
+		luminance_multiplier = (float)(10000.0 / white);
 	}
 
 	bool ok = false;
@@ -126,6 +139,9 @@ static bool copy_dmabuf(struct wlr_buffer *dst,
 		.texture = texture,
 		.clip = clip,
 		.blend_mode = WLR_RENDER_BLEND_MODE_NONE,
+		.transfer_function = pq_source ? WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ : 0,
+		.primaries = pq_source ? &primaries : NULL,
+		.luminance_multiplier = pq_source ? &luminance_multiplier : NULL,
 	});
 
 	ok = wlr_render_pass_submit(pass);
@@ -168,7 +184,6 @@ static bool capture_copy(struct wlr_ext_image_copy_capture_frame_v1 *frame,
 
 	bool ok = false;
 	bool converted = false;
-	bool shm = false;
 	enum ext_image_copy_capture_frame_v1_failure_reason failure_reason =
 		EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_UNKNOWN;
 	struct wlr_dmabuf_attributes dmabuf;
@@ -181,11 +196,21 @@ static bool capture_copy(struct wlr_ext_image_copy_capture_frame_v1 *frame,
 			ok = false;
 			failure_reason = EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS;
 		} else {
-			ok = copy_dmabuf(dst, src, renderer, &frame->buffer_damage);
+			struct wlr_dmabuf_attributes src_dmabuf;
+			converted = description && !scene_sdr &&
+				wlr_buffer_get_dmabuf(src, &src_dmabuf) &&
+				capture_sdr_target(description, src_dmabuf.format, dmabuf.format);
+			if (converted && !renderer->features.input_color_transform) {
+				// Constraints never offer this; refuse rather than send 8-bit PQ.
+				ok = false;
+				failure_reason = EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_BUFFER_CONSTRAINTS;
+			} else {
+				ok = copy_dmabuf(dst, src, renderer, &frame->buffer_damage,
+					converted ? description : NULL);
+			}
 		}
 	} else if (wlr_buffer_begin_data_ptr_access(dst,
 			WLR_BUFFER_DATA_PTR_ACCESS_WRITE, &data, &format, &stride)) {
-		shm = true;
 		bool supported = false;
 		for (size_t i = 0; i < frame->session->source->shm_formats_len; i++) {
 			if (frame->session->source->shm_formats[i] == format) {
@@ -209,13 +234,11 @@ static bool capture_copy(struct wlr_ext_image_copy_capture_frame_v1 *frame,
 		return false;
 	}
 
-	const struct wlr_output_image_description sdr = {
-		.primaries = WLR_COLOR_NAMED_PRIMARIES_SRGB,
-		.transfer_function = WLR_COLOR_TRANSFER_FUNCTION_GAMMA22,
-	};
-	// DMA-BUF uses a rendering path whose HDR color preservation is not yet
-	// guaranteed. Never label those bytes as native PQ without qualification.
-	capture_color_send(frame, (shm || scene_sdr) ? (converted ? &sdr : description) : NULL);
+	const struct wlr_output_image_description sdr = CAPTURE_SDR_DESCRIPTION;
+	// Unconverted copies keep the source encoding: SHM reads back natively and
+	// the default DMA-BUF blit decodes and re-encodes with the same gamma 2.2
+	// curve, so PQ code values pass through unchanged.
+	capture_color_send(frame, converted ? &sdr : description);
 	return true;
 }
 
@@ -346,7 +369,7 @@ static void session_handle_destroy(struct wl_client *client,
 
 static void session_handle_create_frame(struct wl_client *client,
 		struct wl_resource *session_resource, uint32_t new_id) {
-	struct wlr_ext_image_copy_capture_session_v1 *session = session_from_resource(session_resource);
+	struct wlr_ext_image_copy_capture_session_v1 *session = wlr_ext_image_copy_capture_session_v1_from_resource(session_resource);
 
 	if (session != NULL && session->frame != NULL) {
 		wl_resource_post_error(session_resource,
@@ -487,7 +510,7 @@ static void session_handle_source_frame(struct wl_listener *listener, void *data
 }
 
 static void session_handle_resource_destroy(struct wl_resource *resource) {
-	session_destroy(session_from_resource(resource));
+	session_destroy(wlr_ext_image_copy_capture_session_v1_from_resource(resource));
 }
 
 static void session_create(struct wl_resource *parent_resource, uint32_t new_id,

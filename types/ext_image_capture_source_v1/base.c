@@ -109,7 +109,8 @@ static bool add_drm_format(struct wlr_drm_format_set *set, const struct wlr_drm_
 }
 
 bool capture_source_set_constraints(struct wlr_ext_image_capture_source_v1 *source,
-		struct wlr_swapchain *swapchain, struct wlr_renderer *renderer, bool sdr_fallback) {
+		struct wlr_swapchain *swapchain, struct wlr_renderer *renderer, bool sdr_fallback,
+		const struct wlr_output_image_description *description) {
 	// Prepare the complete replacement before notifying any sessions. In
 	// particular, an unavailable read format must clear old SHM constraints.
 	uint32_t native = get_swapchain_shm_format(swapchain, renderer);
@@ -125,6 +126,12 @@ bool capture_source_set_constraints(struct wlr_ext_image_capture_source_v1 *sour
 		formats[0] = native;
 		if (len == 2) {
 			formats[1] = DRM_FORMAT_XRGB8888;
+		}
+		// Clients such as grim take the first usable SHM format and cannot
+		// describe PQ. Offer the SDR conversion first; native PQ stays available.
+		if (len == 2 && capture_is_pq(description)) {
+			formats[0] = DRM_FORMAT_XRGB8888;
+			formats[1] = native;
 		}
 	}
 	int drm_fd = wlr_renderer_get_drm_fd(renderer);
@@ -143,7 +150,16 @@ bool capture_source_set_constraints(struct wlr_ext_image_capture_source_v1 *sour
 		uint32_t fallbacks[] = {DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888};
 		for (size_t i = 0; i < sizeof(fallbacks) / sizeof(fallbacks[0]); i++) {
 			const struct wlr_drm_format *fmt = wlr_drm_format_set_get(render_formats, fallbacks[i]);
-			if (fmt && swapchain->format.format != fmt->format && !add_drm_format(&dmabuf, fmt)) {
+			if (!fmt || swapchain->format.format == fmt->format) {
+				continue;
+			}
+			// Without input transforms the renderer cannot decode PQ, and a
+			// plain blit would deliver 8-bit PQ. Leave those clients to SHM.
+			if (capture_sdr_target(description, swapchain->format.format, fmt->format) &&
+					!renderer->features.input_color_transform) {
+				continue;
+			}
+			if (!add_drm_format(&dmabuf, fmt)) {
 				goto error;
 			}
 		}
@@ -167,7 +183,7 @@ error:
 bool wlr_ext_image_capture_source_v1_set_constraints_from_swapchain(struct wlr_ext_image_capture_source_v1 *source,
 		struct wlr_swapchain *swapchain, struct wlr_renderer *renderer) {
 	// Scene and cursor sources keep their own color and copy semantics.
-	return capture_source_set_constraints(source, swapchain, renderer, false);
+	return capture_source_set_constraints(source, swapchain, renderer, false, NULL);
 }
 
 void wlr_ext_image_capture_source_v1_cursor_init(struct wlr_ext_image_capture_source_v1_cursor *source_cursor,

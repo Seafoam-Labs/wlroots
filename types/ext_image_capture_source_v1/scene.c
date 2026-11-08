@@ -240,6 +240,23 @@ static const struct wlr_ext_image_capture_source_v1_interface source_impl = {
 
 static const struct wlr_backend_impl backend_impl = {0};
 
+bool capture_scene_source_format_encoding(struct wlr_ext_image_capture_source_v1 *base,
+		uint32_t format, struct wlr_output_image_description *out) {
+	if (base->impl != &source_impl) {
+		return false;
+	}
+	struct scene_node_source *source = wl_container_of(base, source, base);
+	struct wlr_renderer *renderer = source->output.renderer;
+	// Nominal: individual frames remain unavailable when a render cannot
+	// establish SDR (see scene_sdr_inputs).
+	if (!renderer || !renderer->features.input_color_transform ||
+			!renderer->features.output_color_transform) {
+		return false;
+	}
+	*out = CAPTURE_SDR_DESCRIPTION;
+	return true;
+}
+
 static void source_update_buffer_constraints(struct scene_node_source *source,
 		const struct wlr_output_state *state) {
 	struct wlr_output *output = &source->output;

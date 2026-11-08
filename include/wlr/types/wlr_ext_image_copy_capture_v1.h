@@ -93,5 +93,7 @@ bool wlr_ext_image_copy_capture_frame_v1_copy_buffer(struct wlr_ext_image_copy_c
 struct wl_global *wlr_aqueous_capture_color_manager_v1_create(struct wl_display *display);
 struct wlr_ext_image_copy_capture_frame_v1 *wlr_ext_image_copy_capture_frame_v1_from_resource(
 	struct wl_resource *resource);
+struct wlr_ext_image_copy_capture_session_v1 *wlr_ext_image_copy_capture_session_v1_from_resource(
+	struct wl_resource *resource);
 
 #endif

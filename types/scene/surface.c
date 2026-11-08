@@ -16,6 +16,151 @@
 #include <wlr/util/region.h>
 #include <wlr/util/transform.h>
 #include "types/wlr_scene.h"
+#include "render/drm_syncobj_merger.h"
+
+struct scene_snapshot {
+	struct wlr_addon addon;
+	struct wlr_addon surface_addon;
+	struct wlr_scene_buffer *buffer;
+	struct wlr_surface *surface;
+	struct wlr_output *output;
+	uint32_t seq;
+	struct wlr_drm_syncobj_merger *release;
+	struct wl_listener destroy, frame, sample;
+};
+
+static void snapshot_destroy(struct wlr_addon *addon) {
+	struct scene_snapshot *snapshot = wl_container_of(addon, snapshot, addon);
+	wlr_addon_finish(addon);
+	if (snapshot->surface != NULL) {
+		wlr_addon_finish(&snapshot->surface_addon);
+	}
+	wl_list_remove(&snapshot->destroy.link);
+	wl_list_remove(&snapshot->frame.link);
+	wl_list_remove(&snapshot->sample.link);
+	if (snapshot->release != NULL) {
+		wlr_drm_syncobj_merger_unref(snapshot->release);
+	}
+	free(snapshot);
+}
+
+static const struct wlr_addon_interface snapshot_impl = {
+	.name = "aqueous-live-snapshot", .destroy = snapshot_destroy,
+};
+
+struct wlr_drm_syncobj_merger *scene_snapshot_release(struct wlr_scene_buffer *buffer) {
+	struct wlr_addon *addon = wlr_addon_find(&buffer->node.addons, NULL, &snapshot_impl);
+	if (addon == NULL) {
+		return NULL;
+	}
+	struct scene_snapshot *snapshot = wl_container_of(addon, snapshot, addon);
+	return snapshot->release;
+}
+
+static void snapshot_surface_destroy(struct wl_listener *listener, void *data) {
+	struct scene_snapshot *snapshot = wl_container_of(listener, snapshot, destroy);
+	wlr_addon_finish(&snapshot->surface_addon);
+	snapshot->surface = NULL;
+	wl_list_remove(&snapshot->destroy.link);
+	wl_list_init(&snapshot->destroy.link);
+}
+
+static void snapshot_surface_addon_destroy(struct wlr_addon *addon) {
+	struct scene_snapshot *snapshot = wl_container_of(addon, snapshot, surface_addon);
+	snapshot_surface_destroy(&snapshot->destroy, NULL);
+}
+
+static const struct wlr_addon_interface snapshot_surface_impl = {
+	.name = "aqueous-preview-pacing", .destroy = snapshot_surface_addon_destroy,
+};
+
+static bool surface_has_snapshot(struct wlr_surface *surface) {
+	struct wlr_addon *addon;
+	wl_list_for_each(addon, &surface->addons.addons, link) {
+		if (addon->impl == &snapshot_surface_impl) {
+			return true;
+		}
+	}
+	return false;
+}
+
+struct wlr_output *scene_surface_preview_output(struct wlr_surface *surface) {
+	struct wlr_addon *addon;
+	wl_list_for_each(addon, &surface->addons.addons, link) {
+		if (addon->impl != &snapshot_surface_impl) {
+			continue;
+		}
+		struct scene_snapshot *snapshot = wl_container_of(addon, snapshot, surface_addon);
+		if (snapshot->output != NULL &&
+				!pixman_region32_empty(&snapshot->buffer->node.visible)) {
+			return snapshot->output;
+		}
+	}
+	return NULL;
+}
+
+static void snapshot_frame(struct wl_listener *listener, void *data) {
+	struct scene_snapshot *snapshot = wl_container_of(listener, snapshot, frame);
+	struct wlr_scene_frame_done_event *event = data;
+	// The scene already filters invisible/disabled buffers. The fixed pacing
+	// output prevents mirror and spanning-output callbacks from running faster.
+	if (snapshot->surface != NULL && event->output->output == snapshot->output) {
+		wlr_surface_send_frame_done(snapshot->surface, &event->when);
+	}
+}
+
+static void snapshot_sample(struct wl_listener *listener, void *data) {
+	struct scene_snapshot *snapshot = wl_container_of(listener, snapshot, sample);
+	struct wlr_scene_output_sample_event *event = data;
+	if (snapshot->release != NULL && !event->release_deferred && event->release_timeline != NULL) {
+		if (!wlr_drm_syncobj_merger_add(snapshot->release, event->release_timeline,
+				event->release_point, event->output->output->event_loop)) {
+			abort();
+		}
+	}
+	if (snapshot->surface != NULL && event->output->output == snapshot->output &&
+			snapshot->surface->current.seq == snapshot->seq) {
+		wlr_presentation_surface_textured_on_output(snapshot->surface, snapshot->output);
+	}
+	// The render list retains the captured release merger through submission,
+	// including non-pacing outputs. Never attach it to a later surface commit.
+}
+
+bool wlr_scene_buffer_snapshot_surface(struct wlr_scene_buffer *buffer,
+		struct wlr_surface *surface, struct wlr_output *output) {
+	assert(wlr_addon_find(&buffer->node.addons, NULL, &snapshot_impl) == NULL);
+	struct scene_snapshot *snapshot = calloc(1, sizeof(*snapshot));
+	if (snapshot == NULL) {
+		return false;
+	}
+	snapshot->surface = surface;
+	snapshot->buffer = buffer;
+	snapshot->output = output;
+	snapshot->seq = surface->current.seq;
+	struct wlr_linux_drm_syncobj_surface_v1_state *state =
+		wlr_linux_drm_syncobj_v1_get_surface_state(surface);
+	struct wlr_scene_buffer_set_buffer_options options = {0};
+	if (state != NULL) {
+		if (state->release_merger != NULL) {
+			snapshot->release = wlr_drm_syncobj_merger_ref(state->release_merger);
+		}
+		options.wait_timeline = state->acquire_timeline;
+		options.wait_point = state->acquire_point;
+	}
+	// Scene imports may already have consumed the source scene's public buffer
+	// reference. The current surface still owns the captured client buffer.
+	wlr_scene_buffer_set_buffer_with_options(buffer,
+		surface->buffer != NULL ? &surface->buffer->base : NULL, &options);
+	wlr_addon_init(&snapshot->addon, &buffer->node.addons, NULL, &snapshot_impl);
+	wlr_addon_init(&snapshot->surface_addon, &surface->addons, buffer, &snapshot_surface_impl);
+	snapshot->destroy.notify = snapshot_surface_destroy;
+	wl_signal_add(&surface->events.destroy, &snapshot->destroy);
+	snapshot->frame.notify = snapshot_frame;
+	wl_signal_add(&buffer->events.frame_done, &snapshot->frame);
+	snapshot->sample.notify = snapshot_sample;
+	wl_signal_add(&buffer->events.output_sample, &snapshot->sample);
+	return true;
+}
 
 struct scene_surface_destination_scale {
 	struct wlr_addon addon;
@@ -70,6 +215,10 @@ static double get_surface_effective_preferred_scale(
 // Output used for frame pacing (surface frame callbacks, presentation
 // time feedback, etc), may be NULL
 static struct wlr_output *get_surface_frame_pacing_output(struct wlr_surface *surface) {
+	struct wlr_output *preview = scene_surface_preview_output(surface);
+	if (preview != NULL) {
+		return preview;
+	}
 	struct wlr_output *frame_pacing_output = NULL;
 	struct wlr_surface_output *surface_output;
 	wl_list_for_each(surface_output, &surface->current_outputs, link) {
@@ -211,10 +360,14 @@ static void handle_scene_buffer_output_sample(
 		return;
 	}
 
-	if (event->direct_scanout) {
-		wlr_presentation_surface_scanned_out_on_output(surface->surface, output);
-	} else {
-		wlr_presentation_surface_textured_on_output(surface->surface, output);
+	// An invisible input tree may still be sampled at opacity zero. Only its
+	// visual preview may claim presentation of the captured generation.
+	if (!surface_has_snapshot(surface->surface)) {
+		if (event->direct_scanout) {
+			wlr_presentation_surface_scanned_out_on_output(surface->surface, output);
+		} else {
+			wlr_presentation_surface_textured_on_output(surface->surface, output);
+		}
 	}
 
 	struct wlr_linux_drm_syncobj_surface_v1_state *syncobj_surface_state =
@@ -236,6 +389,9 @@ static void handle_scene_buffer_frame_done(
 	struct wlr_scene_frame_done_event *event = data;
 	if (get_surface_frame_pacing_output(surface->surface) != event->output->output) {
 		return;
+	}
+	if (surface_has_snapshot(surface->surface)) {
+		return; // Preview visibility, not settled input geometry, drives repaint.
 	}
 
 	wlr_surface_send_frame_done(surface->surface, &event->when);
@@ -387,6 +543,8 @@ static void surface_reconfigure(struct wlr_scene_surface *scene_surface) {
 	wlr_scene_buffer_set_primaries(scene_buffer, primaries);
 	wlr_scene_buffer_set_color_encoding(scene_buffer, color_encoding);
 	wlr_scene_buffer_set_color_range(scene_buffer, color_range);
+	wlr_scene_buffer_set_windows_scrgb(scene_buffer,
+		img_desc != NULL && img_desc->kind == WLR_IMAGE_DESCRIPTION_V1_WINDOWS_SCRGB);
 
 	scene_buffer_unmark_client_buffer(scene_buffer);
 

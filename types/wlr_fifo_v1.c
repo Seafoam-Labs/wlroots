@@ -9,6 +9,7 @@
 #include <wlr/types/wlr_subcompositor.h>
 #include "fifo-v1-protocol.h"
 #include "types/wlr_fifo_v1.h"
+#include "types/wlr_scene.h"
 
 struct wlr_fifo_manager_v1 {
     struct wl_global *global;
@@ -57,6 +58,8 @@ static bool synchronized(struct wlr_surface *surface) {
 }
 /* Match scene/surface.c's frame-pacing output, including suspended visibility. */
 static struct wlr_output *pacing_output(struct wlr_surface *surface) {
+    struct wlr_output *preview = scene_surface_preview_output(surface);
+    if (preview != NULL && preview->enabled) return preview;
     struct wlr_output *output = NULL;
     struct wlr_surface_output *entered;
     wl_list_for_each(entered, &surface->current_outputs, link) {

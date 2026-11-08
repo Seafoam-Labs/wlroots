@@ -129,7 +129,28 @@ static void source_update_buffer_constraints(struct wlr_ext_output_image_capture
 	}
 
 	source->constraints_valid = capture_source_set_constraints(&source->base,
-		output->swapchain, output->renderer, capture_can_convert_sdr(output->image_description));
+		output->swapchain, output->renderer, capture_can_convert_sdr(output->image_description),
+		output->image_description);
+}
+
+bool capture_output_source_format_encoding(struct wlr_ext_image_capture_source_v1 *base,
+		uint32_t format, struct wlr_output_image_description *out) {
+	if (base->impl != &output_source_impl) {
+		return false;
+	}
+	struct wlr_ext_output_image_capture_source_v1 *source = wl_container_of(base, source, base);
+	struct wlr_output *output = source->output;
+	// constraints_valid is assigned only after constraints_update listeners run.
+	if (!output->enabled || !output->swapchain) {
+		return false;
+	}
+	const struct wlr_output_image_description *desc = output->image_description;
+	if (!desc || capture_sdr_target(desc, output->swapchain->format.format, format)) {
+		*out = CAPTURE_SDR_DESCRIPTION;
+	} else {
+		*out = *desc;
+	}
+	return true;
 }
 
 static void source_handle_output_commit(struct wl_listener *listener,

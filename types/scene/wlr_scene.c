@@ -1184,6 +1184,20 @@ void wlr_scene_buffer_set_force_blend(struct wlr_scene_buffer *scene_buffer,
 	scene_node_update(&scene_buffer->node, NULL);
 }
 
+void wlr_scene_buffer_set_windows_scrgb(struct wlr_scene_buffer *scene_buffer,
+		int windows_scrgb) {
+	if (scene_buffer->windows_scrgb == (windows_scrgb != 0)) {
+		return;
+	}
+
+	scene_buffer->windows_scrgb = windows_scrgb != 0;
+	scene_node_update(&scene_buffer->node, NULL);
+}
+
+bool wlr_scene_buffer_get_windows_scrgb(const struct wlr_scene_buffer *scene_buffer) {
+	return scene_buffer->windows_scrgb;
+}
+
 void wlr_scene_buffer_set_source_box(struct wlr_scene_buffer *scene_buffer,
 		const struct wlr_fbox *box) {
 	if (wlr_fbox_equal(&scene_buffer->src_box, box)) {
@@ -1655,11 +1669,9 @@ static float scene_buffer_luminance(struct wlr_scene_buffer *scene_buffer,
 		struct wlr_color_luminances pq_lum;
 		wlr_color_transfer_function_get_default_luminance(
 			WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ, &pq_lum);
-		struct wlr_scene_surface *scene_surface = wlr_scene_surface_try_from_buffer(scene_buffer);
-		bool windows_scrgb =
-			scene_surface != NULL &&
-			wlr_surface_has_windows_scrgb_image_description(scene_surface->surface);
-		if (windows_scrgb) {
+		// Read the buffer's own flag rather than the surface: snapshot
+		// clones have no surface and would otherwise take the SDR-white gain.
+		if (scene_buffer->windows_scrgb) {
 			luminance_multiplier *= 80.0f / pq_lum.reference;
 		} else if (out_img_desc->sdr_white_level > 0) {
 			luminance_multiplier *= (float)(out_img_desc->sdr_white_level / pq_lum.reference);
@@ -1675,6 +1687,11 @@ static void scene_entry_prepare_release(struct render_list_entry *entry,
 		struct wlr_scene_buffer *buffer, struct wlr_scene_output *output) {
 	assert(entry->release_merger == NULL);
 	if (output->in_timeline == NULL) {
+		return;
+	}
+	struct wlr_drm_syncobj_merger *snapshot = scene_snapshot_release(buffer);
+	if (snapshot != NULL) {
+		entry->release_merger = wlr_drm_syncobj_merger_ref(snapshot);
 		return;
 	}
 	struct wlr_scene_surface *surface = wlr_scene_surface_try_from_buffer(buffer);

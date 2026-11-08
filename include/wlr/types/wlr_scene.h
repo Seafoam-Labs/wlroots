@@ -201,6 +201,14 @@ struct wlr_scene_frame_done_event {
 	struct timespec when;
 };
 
+/** Attach a captured surface generation to an input-inert snapshot. Keeps its
+ * explicit-sync release alive and forwards visible frame callbacks on output.
+ * Presentation is forwarded only while the captured commit is still current.
+ * Call once, before rendering the snapshot. Does not confer surface identity.
+ */
+bool wlr_scene_buffer_snapshot_surface(struct wlr_scene_buffer *buffer,
+    struct wlr_surface *surface, struct wlr_output *output);
+
 /** A scene-graph node displaying a buffer */
 struct wlr_scene_buffer {
 	struct wlr_scene_node node;
@@ -237,6 +245,10 @@ struct wlr_scene_buffer {
 	enum wlr_color_encoding color_encoding;
 	enum wlr_color_range color_range;
 	bool force_blend;
+	// Predefined Windows-scRGB content (1.0 = 80 cd/m², client-managed HDR).
+	// Carried on the buffer so snapshots keep the fixed stimulus mapping after
+	// they lose access to the source surface.
+	bool windows_scrgb;
 
 	struct {
 		uint64_t active_outputs;
@@ -627,6 +639,16 @@ void wlr_scene_buffer_set_opaque_region(struct wlr_scene_buffer *scene_buffer,
  */
 void wlr_scene_buffer_set_force_blend(struct wlr_scene_buffer *scene_buffer,
 	int force_blend);
+
+/**
+ * Mark the buffer as predefined Windows-scRGB content (1.0 = 80 cd/m²), which
+ * bypasses the SDR white level on HDR outputs. Set automatically for surface
+ * buffers; compositors copying a buffer into a snapshot must copy it too.
+ */
+void wlr_scene_buffer_set_windows_scrgb(struct wlr_scene_buffer *scene_buffer,
+	int windows_scrgb);
+
+bool wlr_scene_buffer_get_windows_scrgb(const struct wlr_scene_buffer *scene_buffer);
 
 /**
  * Set the source rectangle describing the region of the buffer which will be

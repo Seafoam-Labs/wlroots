@@ -1162,7 +1162,6 @@ struct wlr_color_manager_v1 *wlr_color_manager_v1_create(struct wl_display *disp
 	assert(!options->features.set_primaries);
 	assert(!options->features.set_tf_power);
 	assert(!options->features.set_luminances);
-	assert(!options->features.extended_target_volume);
 
 	struct wlr_color_manager_v1 *manager = calloc(1, sizeof(*manager));
 	if (manager == NULL) {

@@ -10,6 +10,13 @@ struct capture_color_info {
 	bool sent;
 };
 
+struct capture_color_session {
+	struct wl_resource *resource;
+	struct wlr_ext_image_copy_capture_session_v1 *session;
+	struct wl_listener session_destroy;
+	struct wl_listener constraints_update;
+};
+
 struct capture_color_manager {
 	struct wl_global *global;
 	struct wl_listener display_destroy;
@@ -39,6 +46,104 @@ static void resource_destroy(struct wl_client *client, struct wl_resource *resou
 	wl_resource_destroy(resource);
 }
 
+static uint32_t scaled(double value, double scale);
+static bool encoding_args(const struct wlr_output_image_description *desc,
+	uint32_t *primaries, uint32_t *tf, uint32_t *reference, uint32_t *white);
+
+bool capture_source_format_encoding(struct wlr_ext_image_capture_source_v1 *source,
+		uint32_t format, struct wlr_output_image_description *out) {
+	return capture_output_source_format_encoding(source, format, out) ||
+		capture_scene_source_format_encoding(source, format, out);
+}
+
+static void session_info_send_format(struct capture_color_session *info, uint32_t format) {
+	struct wlr_output_image_description desc;
+	uint32_t primaries, tf, reference, white;
+	if (capture_source_format_encoding(info->session->source, format, &desc) &&
+			encoding_args(&desc, &primaries, &tf, &reference, &white)) {
+		aqueous_capture_color_session_v1_send_format(info->resource,
+			format, primaries, tf, reference, white);
+	}
+}
+
+static void session_info_send(struct capture_color_session *info) {
+	if (info->session) {
+		struct wlr_ext_image_capture_source_v1 *source = info->session->source;
+		for (size_t i = 0; i < source->shm_formats_len; i++) {
+			session_info_send_format(info, source->shm_formats[i]);
+		}
+		for (size_t i = 0; i < source->dmabuf_formats.len; i++) {
+			uint32_t format = source->dmabuf_formats.formats[i].format;
+			bool seen = false;
+			for (size_t j = 0; j < source->shm_formats_len; j++) {
+				seen = seen || source->shm_formats[j] == format;
+			}
+			if (!seen) {
+				session_info_send_format(info, format);
+			}
+		}
+	}
+	aqueous_capture_color_session_v1_send_done(info->resource);
+}
+
+static void session_info_detach(struct capture_color_session *info) {
+	if (!info->session) {
+		return;
+	}
+	wl_list_remove(&info->session_destroy.link);
+	wl_list_remove(&info->constraints_update.link);
+	info->session = NULL;
+}
+
+static void session_info_handle_session_destroy(struct wl_listener *listener, void *data) {
+	struct capture_color_session *info = wl_container_of(listener, info, session_destroy);
+	session_info_detach(info);
+}
+
+static void session_info_handle_constraints_update(struct wl_listener *listener, void *data) {
+	struct capture_color_session *info = wl_container_of(listener, info, constraints_update);
+	session_info_send(info);
+}
+
+static void session_info_destroy(struct wl_resource *resource) {
+	struct capture_color_session *info = wl_resource_get_user_data(resource);
+	session_info_detach(info);
+	free(info);
+}
+
+static const struct aqueous_capture_color_session_v1_interface session_info_impl = {
+	.destroy = resource_destroy,
+};
+
+static void get_session_info(struct wl_client *client, struct wl_resource *resource,
+		uint32_t id, struct wl_resource *session_resource) {
+	struct capture_color_session *info = calloc(1, sizeof(*info));
+	if (!info) {
+		wl_resource_post_no_memory(resource);
+		return;
+	}
+	info->resource = wl_resource_create(client, &aqueous_capture_color_session_v1_interface,
+		wl_resource_get_version(resource), id);
+	if (!info->resource) {
+		free(info);
+		wl_resource_post_no_memory(resource);
+		return;
+	}
+	wl_resource_set_implementation(info->resource, &session_info_impl, info,
+		session_info_destroy);
+	// An inert session has no source; its description is empty.
+	info->session = wlr_ext_image_copy_capture_session_v1_from_resource(session_resource);
+	if (info->session) {
+		info->session_destroy.notify = session_info_handle_session_destroy;
+		wl_signal_add(&info->session->events.destroy, &info->session_destroy);
+		// Added after the session's own listener, so updates follow its done.
+		info->constraints_update.notify = session_info_handle_constraints_update;
+		wl_signal_add(&info->session->source->events.constraints_update,
+			&info->constraints_update);
+	}
+	session_info_send(info);
+}
+
 static const struct aqueous_capture_color_info_v1_interface info_impl = {
 	.destroy = resource_destroy,
 };
@@ -62,7 +167,8 @@ static void get_frame_info(struct wl_client *client, struct wl_resource *resourc
 		wl_resource_post_no_memory(resource);
 		return;
 	}
-	info->resource = wl_resource_create(client, &aqueous_capture_color_info_v1_interface, 1, id);
+	info->resource = wl_resource_create(client, &aqueous_capture_color_info_v1_interface,
+		wl_resource_get_version(resource), id);
 	if (!info->resource) {
 		free(info);
 		wl_resource_post_no_memory(resource);
@@ -76,6 +182,7 @@ static void get_frame_info(struct wl_client *client, struct wl_resource *resourc
 static const struct aqueous_capture_color_manager_v1_interface manager_impl = {
 	.destroy = resource_destroy,
 	.get_frame_info = get_frame_info,
+	.get_session_info = get_session_info,
 };
 
 static void manager_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id) {
@@ -101,7 +208,7 @@ struct wl_global *wlr_aqueous_capture_color_manager_v1_create(struct wl_display 
 		return NULL;
 	}
 	manager->global = wl_global_create(display, &aqueous_capture_color_manager_v1_interface,
-		1, manager, manager_bind);
+		2, manager, manager_bind);
 	if (!manager->global) {
 		free(manager);
 		return NULL;
@@ -118,6 +225,28 @@ static uint32_t scaled(double value, double scale) {
 	return (uint32_t)llround(fmin(value * scale, UINT32_MAX));
 }
 
+static bool encoding_args(const struct wlr_output_image_description *desc,
+		uint32_t *primaries, uint32_t *tf, uint32_t *reference, uint32_t *white) {
+	switch (desc->primaries) {
+	case WLR_COLOR_NAMED_PRIMARIES_SRGB: *primaries = AQUEOUS_CAPTURE_COLOR_INFO_V1_PRIMARIES_SRGB; break;
+	case WLR_COLOR_NAMED_PRIMARIES_BT2020: *primaries = AQUEOUS_CAPTURE_COLOR_INFO_V1_PRIMARIES_BT2020; break;
+	default: return false;
+	}
+	switch (desc->transfer_function) {
+	case WLR_COLOR_TRANSFER_FUNCTION_GAMMA22: *tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_GAMMA22; break;
+	case WLR_COLOR_TRANSFER_FUNCTION_SRGB: *tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_SRGB; break;
+	case WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ: *tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_PQ; break;
+	case WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR: *tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_LINEAR; break;
+	case WLR_COLOR_TRANSFER_FUNCTION_BT1886: *tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_BT1886; break;
+	default: return false;
+	}
+	bool pq = desc->transfer_function == WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ;
+	double ref = pq ? 203.0 : 80.0;
+	*reference = scaled(ref, 10000);
+	*white = scaled(pq && desc->sdr_white_level > 0 ? desc->sdr_white_level : ref, 10000);
+	return true;
+}
+
 void capture_color_send(struct wlr_ext_image_copy_capture_frame_v1 *frame,
 		const struct wlr_output_image_description *desc) {
 	struct wl_listener *listener = wl_signal_get(&frame->events.destroy, info_frame_destroy);
@@ -132,25 +261,13 @@ void capture_color_send(struct wlr_ext_image_copy_capture_frame_v1 *frame,
 		info_unavailable(info);
 		return;
 	}
-	uint32_t primaries, tf;
-	switch (desc->primaries) {
-	case WLR_COLOR_NAMED_PRIMARIES_SRGB: primaries = AQUEOUS_CAPTURE_COLOR_INFO_V1_PRIMARIES_SRGB; break;
-	case WLR_COLOR_NAMED_PRIMARIES_BT2020: primaries = AQUEOUS_CAPTURE_COLOR_INFO_V1_PRIMARIES_BT2020; break;
-	default: info_unavailable(info); return;
+	uint32_t primaries, tf, reference, white;
+	if (!encoding_args(desc, &primaries, &tf, &reference, &white)) {
+		info_unavailable(info);
+		return;
 	}
-	switch (desc->transfer_function) {
-	case WLR_COLOR_TRANSFER_FUNCTION_GAMMA22: tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_GAMMA22; break;
-	case WLR_COLOR_TRANSFER_FUNCTION_SRGB: tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_SRGB; break;
-	case WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ: tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_PQ; break;
-	case WLR_COLOR_TRANSFER_FUNCTION_EXT_LINEAR: tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_LINEAR; break;
-	case WLR_COLOR_TRANSFER_FUNCTION_BT1886: tf = AQUEOUS_CAPTURE_COLOR_INFO_V1_TRANSFER_FUNCTION_BT1886; break;
-	default: info_unavailable(info); return;
-	}
-	bool pq = desc->transfer_function == WLR_COLOR_TRANSFER_FUNCTION_ST2084_PQ;
-	double reference = pq ? 203.0 : 80.0;
-	double white = pq && desc->sdr_white_level > 0 ? desc->sdr_white_level : reference;
 	aqueous_capture_color_info_v1_send_encoding(info->resource, primaries, tf,
-		scaled(reference, 10000), scaled(white, 10000));
+		reference, white);
 	const struct wlr_color_primaries *p = &desc->mastering_display_primaries;
 	if (desc->mastering_luminance.max > 0 && p->red.y > 0 &&
 			p->green.y > 0 && p->blue.y > 0 && p->white.y > 0) {
