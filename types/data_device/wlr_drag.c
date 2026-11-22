@@ -174,7 +174,7 @@ static void drag_destroy(struct wlr_drag *drag) {
 	assert(wl_list_empty(&drag->events.drop.listener_list));
 	assert(wl_list_empty(&drag->events.destroy.listener_list));
 
-	if (drag->source) {
+	if (drag->source && !drag->source_destroying) {
 		wl_list_remove(&drag->source_destroy.link);
 	}
 	wl_list_remove(&drag->focus_destroy.link);
@@ -182,7 +182,7 @@ static void drag_destroy(struct wlr_drag *drag) {
 	if (drag->icon != NULL) {
 		drag_icon_destroy(drag->icon);
 	}
-	struct wlr_data_source *cancel_source = !drag->dropped &&
+	struct wlr_data_source *cancel_source = !drag->dropped && !drag->source_destroying &&
 		wlr_xdg_toplevel_drag_v1_try_from_data_source(drag->source) ? drag->source : NULL;
 	free(drag);
 	// Grab cancellation must end the source operation as well. Its drag
@@ -428,7 +428,11 @@ static void drag_handle_drag_source_destroy(struct wl_listener *listener,
 		void *data) {
 	struct wlr_drag *drag = wl_container_of(listener, drag, source_destroy);
 	wl_list_remove(&drag->source_destroy.link);
-	drag->source = NULL;
+	wl_list_init(&drag->source_destroy.link);
+	// Keep drag->source valid while the drag is torn down: focus/destroy
+	// listeners (e.g. the Xwayland DND bridge) still dereference it. The
+	// source memory stays alive until its destroy signal finishes emitting.
+	drag->source_destroying = true;
 	drag_destroy(drag);
 }
 

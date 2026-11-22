@@ -121,6 +121,7 @@ struct wlr_drag {
 	struct wlr_data_source *source; // can be NULL
 
 	bool started, dropped, cancelling;
+	bool source_destroying; // source destroy signal is being emitted
 	int32_t grab_touch_id, touch_id; // if WLR_DRAG_GRAB_TOUCH
 
 	struct {
