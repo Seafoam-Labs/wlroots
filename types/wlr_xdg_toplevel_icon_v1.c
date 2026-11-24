@@ -42,7 +42,6 @@ static size_t total_bytes, total_icons;
 
 struct icon_private {
     struct wlr_xdg_toplevel_icon_v1 base;
-    struct wl_resource *resource;
     struct icon_account *account;
     size_t bytes, variants;
 };
@@ -55,7 +54,6 @@ struct icon_pixels {
 };
 struct icon_variant {
     struct wlr_xdg_toplevel_icon_v1_buffer base;
-    struct wl_listener destroy;
     struct icon_private *icon;
 };
 
@@ -120,20 +118,12 @@ static const struct wlr_buffer_impl pixels_impl = {
     .end_data_ptr_access = pixels_end,
 };
 static void variant_destroy(struct icon_variant *variant) {
-    wl_list_remove(&variant->destroy.link);
     wl_list_remove(&variant->base.link);
     struct icon_pixels *pixels = wl_container_of(variant->base.buffer, pixels, base);
     variant->icon->bytes -= pixels->size;
     variant->icon->variants--;
     wlr_buffer_unlock(variant->base.buffer);
     free(variant);
-}
-static void variant_resource_destroy(struct wl_listener *listener, void *data) {
-    struct icon_variant *variant = wl_container_of(listener, variant, destroy);
-    wl_list_remove(&variant->destroy.link);
-    wl_list_init(&variant->destroy.link);
-    wl_resource_post_error(variant->icon->resource,
-        XDG_TOPLEVEL_ICON_V1_ERROR_NO_BUFFER, "icon buffer destroyed before icon");
 }
 static void icon_destroy(struct wlr_xdg_toplevel_icon_v1 *icon) {
     struct icon_private *priv = wl_container_of(icon, priv, base);
@@ -185,8 +175,11 @@ static void icon_handle_add_buffer(struct wl_client *client, struct wl_resource 
 	}
 
     struct icon_private *priv = wl_container_of(icon, priv, base);
-    // Borrow the native SHM buffer without locking it: this protocol does not
-    // use wl_buffer.release. The request and copy run on the display thread.
+    // Copy the pixels into compositor-owned memory on the display thread, so
+    // the client's wl_buffer is never referenced after this request returns.
+    // Early buffer destruction is deliberately tolerated (no_buffer is not
+    // posted): Wine/Proton destroys icon buffers before the icon object, and
+    // upstream wlroots is likewise lenient. The wl_buffer.release event is unused.
     struct wlr_buffer *buffer = wlr_shm_buffer_try_from_resource(buffer_resource);
     if (buffer == NULL || buffer->width != buffer->height) {
         wl_resource_post_error(resource, XDG_TOPLEVEL_ICON_V1_ERROR_INVALID_BUFFER,
@@ -264,8 +257,6 @@ static void icon_handle_add_buffer(struct wl_client *client, struct wl_resource 
     wlr_buffer_drop(&pixels->base);
     variant->base.scale = scale;
     variant->icon = priv;
-    variant->destroy.notify = variant_resource_destroy;
-    wl_resource_add_destroy_listener(buffer_resource, &variant->destroy);
     if (old != NULL) {
         variant_destroy(old);
     }
@@ -281,15 +272,7 @@ static const struct xdg_toplevel_icon_v1_interface icon_impl = {
 };
 
 static void icon_handle_resource_destroy(struct wl_resource *resource) {
-	struct wlr_xdg_toplevel_icon_v1 *icon = icon_from_resource(resource);
-    struct icon_private *priv = wl_container_of(icon, priv, base);
-    priv->resource = NULL;
-    struct icon_variant *variant;
-    wl_list_for_each(variant, &icon->buffers, base.link) {
-        wl_list_remove(&variant->destroy.link);
-        wl_list_init(&variant->destroy.link);
-    }
-    wlr_xdg_toplevel_icon_v1_unref(icon);
+	wlr_xdg_toplevel_icon_v1_unref(icon_from_resource(resource));
 }
 
 struct wlr_xdg_toplevel_icon_v1 *wlr_xdg_toplevel_icon_v1_ref(
@@ -347,7 +330,6 @@ static void manager_handle_create_icon(struct wl_client *client, struct wl_resou
 
 	wl_list_init(&icon->buffers);
     icon->n_refs = 1;
-    priv->resource = icon_resource;
     priv->account = account;
     account->refs++;
     account->icons++;
